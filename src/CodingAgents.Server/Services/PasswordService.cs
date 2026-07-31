@@ -56,9 +56,24 @@ public class PasswordService
             if (cred == null)
             {
                 var (hash, salt) = HashPassword(DefaultPassword);
-                cred = new AppCredential { Id = 1, PasswordHash = hash, PasswordSalt = salt };
+
+                // The AppCredentials table exists in two shapes in the wild: created by
+                // EnsureCreated() the Id is an IDENTITY column (an explicit value is rejected),
+                // while the older raw SQL patch created it without IDENTITY (a value is
+                // required). Try the identity-friendly insert first, then fall back.
+                cred = new AppCredential { PasswordHash = hash, PasswordSalt = salt };
                 db.AppCredentials.Add(cred);
-                await db.SaveChangesAsync();
+                try
+                {
+                    await db.SaveChangesAsync();
+                }
+                catch (DbUpdateException)
+                {
+                    db.Entry(cred).State = EntityState.Detached;
+                    cred = new AppCredential { Id = 1, PasswordHash = hash, PasswordSalt = salt };
+                    db.AppCredentials.Add(cred);
+                    await db.SaveChangesAsync();
+                }
             }
             return cred;
         }

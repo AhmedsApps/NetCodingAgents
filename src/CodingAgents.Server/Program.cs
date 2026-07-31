@@ -130,8 +130,10 @@ try
 
                 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='AppCredentials' and xtype='U')
                 BEGIN
+                    -- Id must be IDENTITY to match EF's convention for int primary keys,
+                    -- otherwise inserts fail depending on which path created the table.
                     CREATE TABLE AppCredentials (
-                        Id int NOT NULL PRIMARY KEY,
+                        Id int IDENTITY(1,1) NOT NULL PRIMARY KEY,
                         PasswordHash nvarchar(max) NOT NULL,
                         PasswordSalt nvarchar(max) NOT NULL
                     );
