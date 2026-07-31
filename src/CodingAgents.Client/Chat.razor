@@ -958,7 +958,7 @@ else
                 Type = "Error",
                 Content = $"Startup Connection Error: Could not connect to backend server. Details: {ex.Message}"
             });
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -973,7 +973,7 @@ else
 
         _loggingIn = true;
         _loginError = string.Empty;
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
 
         try
         {
@@ -1006,7 +1006,7 @@ else
         finally
         {
             _loggingIn = false;
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1021,7 +1021,7 @@ else
         {
             _passwordMessage = "The new passwords do not match.";
             _passwordChangeFailed = true;
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
             return;
         }
 
@@ -1046,7 +1046,7 @@ else
             _passwordMessage = $"Error changing password: {ex.Message}";
             _passwordChangeFailed = true;
         }
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
     }
 
     private async Task RefreshArtifactToken()
@@ -1076,7 +1076,7 @@ else
         _settingsMessage = string.Empty;
         _mobileShowChat = false;
         _mobileShowWorkflowDetail = false;
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
 
         if (tab == "chat")
         {
@@ -1098,7 +1098,7 @@ else
         if (_hubConnection != null)
         {
             _sessions = await _hubConnection.InvokeAsync<List<ConversationSession>>("GetSessions");
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1114,7 +1114,7 @@ else
         _progressLogs.Clear();
         _isAgentRunning = false;
         _mobileShowChat = true;
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
 
         if (_hubConnection != null)
         {
@@ -1155,7 +1155,7 @@ else
         var prompt = _userInput;
         _userInput = string.Empty;
         _isAgentRunning = true;
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
 
         try
         {
@@ -1170,7 +1170,7 @@ else
                 Content = $"Failed sending: {ex.Message}"
             });
             _isAgentRunning = false;
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1203,7 +1203,7 @@ else
                 Type = "Error",
                 Content = $"'{file.Name}' is too large ({file.Size / (1024 * 1024)} MB). The maximum upload size is 10 MB."
             });
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
             return;
         }
 
@@ -1223,7 +1223,7 @@ else
                 Type = "Error",
                 Content = $"Upload failed: {ex.Message}"
             });
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1282,7 +1282,7 @@ else
         if (_hubConnection != null)
         {
             _workflows = await _hubConnection.InvokeAsync<List<WorkflowDto>>("GetWorkflows");
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1297,7 +1297,7 @@ else
         _workflowLogs.Clear();
         _selectedWorkflow = null;
         _mobileShowWorkflowDetail = true;
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
 
         if (_hubConnection != null)
         {
@@ -1305,7 +1305,7 @@ else
             var list = await _hubConnection.InvokeAsync<List<WorkflowDto>>("GetWorkflows");
             _selectedWorkflow = list.FirstOrDefault(w => w.Id == workflowId);
             _workflowLogs = await _hubConnection.InvokeAsync<List<WorkflowLogDto>>("GetWorkflowLogs", workflowId);
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1318,7 +1318,7 @@ else
         var workspace = _workflowWorkspace;
         _workflowInput = string.Empty;
         _workflowWorkspace = string.Empty;
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
 
         try
         {
@@ -1354,7 +1354,7 @@ else
         if (_hubConnection == null || string.IsNullOrWhiteSpace(_followUpInput)) return;
         var message = _followUpInput;
         _followUpInput = string.Empty;
-        StateHasChanged();
+        await InvokeAsync(StateHasChanged);
         try { await _hubConnection.InvokeAsync("SendWorkflowFollowUp", workflowId, message); }
         catch (Exception ex) { Console.WriteLine($"Error sending follow-up: {ex.Message}"); }
     }
@@ -1401,7 +1401,7 @@ else
         {
             _dbSettings = await _hubConnection.InvokeAsync<SystemSettings>("GetSettings");
             _modelConfigs = await _hubConnection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations");
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1412,7 +1412,7 @@ else
             _loadingModels = true;
             _modelLoadError = string.Empty;
             _localModels.Clear();
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
             try
             {
                 _localModels = await _hubConnection.InvokeAsync<List<string>>("GetLocalModels", _editingModelConfig.BaseUrl);
@@ -1428,7 +1428,7 @@ else
             finally
             {
                 _loadingModels = false;
-                StateHasChanged();
+                await InvokeAsync(StateHasChanged);
             }
         }
     }
@@ -1452,11 +1452,11 @@ else
             {
                 _settingsMessage = $"Error saving: {ex.Message}";
             }
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
 
             await Task.Delay(3000);
             _settingsMessage = string.Empty;
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1487,7 +1487,7 @@ else
             await _hubConnection.InvokeAsync("SaveModelConfiguration", _editingModelConfig);
             _modelConfigs = await _hubConnection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations");
             _isEditingModelConfig = false;
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1497,7 +1497,7 @@ else
         {
             await _hubConnection.InvokeAsync("DeleteModelConfiguration", id);
             _modelConfigs = await _hubConnection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations");
-            StateHasChanged();
+            await InvokeAsync(StateHasChanged);
         }
     }
 
