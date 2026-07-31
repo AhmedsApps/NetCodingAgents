@@ -42,6 +42,9 @@ public class Worker : BackgroundService
     private readonly string _serverUrl;
     private readonly string _workspaceRoot;
     private readonly string _workerKey;
+    // Wall-clock cap for a single agent run. Long tasks on slow local models can exceed
+    // the default, so it is configurable via "AgentTimeoutMinutes".
+    private readonly int _agentTimeoutMinutes;
 
     // Cancellation sources for workflows currently running, keyed by workflow id, so a
     // user-requested Stop can cancel the specific in-flight pipeline.
@@ -63,6 +66,7 @@ public class Worker : BackgroundService
         // Shared secret proving to the server that this really is the local agent worker.
         // Must match the server's "WorkerKey" setting.
         _workerKey = configuration["WorkerKey"] ?? "change-me-worker-key";
+        _agentTimeoutMinutes = int.TryParse(configuration["AgentTimeoutMinutes"], out var atm) && atm > 0 ? atm : 20;
 
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         // Root under which each chat session / workflow gets its own isolated working folder.
@@ -344,12 +348,23 @@ Guidelines:
             _logger.LogInformation("[ChatAgent] Execution completed successfully.");
             await _connection.SendAsync("ReportWorkerResponse", sessionId, assistantContent);
         }
+        catch (OperationCanceledException)
+        {
+            // Worker shutting down or run cancelled: expected, not a failure.
+            _logger.LogInformation("[ChatAgent] Run cancelled for session {Id}.", sessionId);
+            try { await _connection.SendAsync("ReportWorkerProgress", sessionId, "Status", "The agent run was cancelled."); } catch {}
+        }
+        catch (TimeoutException tex)
+        {
+            _logger.LogWarning("[ChatAgent] {Message}", tex.Message);
+            try { await _connection.SendAsync("ReportWorkerProgress", sessionId, "Error", "TIMEOUT: " + tex.Message); } catch {}
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "[ChatAgent] Error executing agent");
             try
             {
-                await _connection.SendAsync("ReportWorkerProgress", sessionId, "Error", $"Agent Execution Error: {ex.Message}\n{ex.StackTrace}");
+                await _connection.SendAsync("ReportWorkerProgress", sessionId, "Error", DescribeError(ex));
             }
             catch {}
         }
@@ -463,12 +478,81 @@ Guidelines:
 
     // Runs an agent with an overall wall-clock cap (linked to the caller's token) so a model
     // stuck repeatedly calling tools can't run forever, and returns its text output.
-    private static async Task<string> RunAgentTextAsync(ChatClientAgent agent, string prompt, CancellationToken ct, int timeoutMinutes = 20)
+    /// <summary>
+    /// Turns an exception into a clear, actionable message so the user can tell a network
+    /// problem from a configuration problem from a model problem, instead of reading a raw
+    /// exception string.
+    /// </summary>
+    private string DescribeError(Exception ex)
     {
+        // Walk to the innermost cause; the useful detail is usually at the bottom.
+        var root = ex;
+        while (root.InnerException != null) root = root.InnerException;
+
+        switch (ex)
+        {
+            case TimeoutException:
+                return "TIMEOUT: " + ex.Message;
+
+            case OperationCanceledException:
+                return "CANCELLED: the run was stopped before it finished.";
+
+            // Raised by CreateChatClientAsync for missing or unreachable models.
+            case InvalidOperationException:
+                return "CONFIGURATION: " + ex.Message;
+
+            case HttpRequestException http:
+            {
+                var m = http.Message;
+                var lower = m.ToLowerInvariant();
+                if (m.Contains("401") || m.Contains("403") || lower.Contains("unauthorized"))
+                    return "AUTHENTICATION: the AI provider rejected the API key. Check the key and base URL under Settings > Model Configurations.";
+                if (m.Contains("429"))
+                    return "RATE LIMIT: the AI provider is throttling requests. Wait a moment, or switch to a different model.";
+                if (m.Contains("404"))
+                    return "NOT FOUND: the AI provider returned 404 - the model name or base URL is likely wrong. Details: " + m;
+                if (root is System.Net.Sockets.SocketException)
+                    return "NETWORK: could not reach the AI model service. Check that Ollama (or your provider URL) is running and reachable. Details: " + root.Message;
+                return "NETWORK: failed talking to the AI provider. Details: " + m;
+            }
+
+            case System.Net.Sockets.SocketException:
+                return "NETWORK: the connection failed or was dropped. Details: " + ex.Message;
+
+            case IOException:
+                return "WORKER FILE ERROR: a file operation failed on the worker machine. Details: " + ex.Message;
+
+            case UnauthorizedAccessException:
+                return "WORKER PERMISSION: the worker is not allowed to access that path. Details: " + ex.Message;
+
+            case Microsoft.AspNetCore.SignalR.HubException:
+                return "SERVER: the server rejected the request. Details: " + ex.Message;
+        }
+
+        if (root is System.Net.Sockets.SocketException)
+            return "NETWORK: the connection to the AI service or server was dropped. Details: " + root.Message;
+
+        return "UNEXPECTED (" + ex.GetType().Name + "): " + ex.Message;
+    }
+
+    private async Task<string> RunAgentTextAsync(ChatClientAgent agent, string prompt, CancellationToken ct, int? timeoutMinutes = null)
+    {
+        int minutes = timeoutMinutes ?? _agentTimeoutMinutes;
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromMinutes(timeoutMinutes));
-        var response = await agent.RunAsync(prompt, cancellationToken: cts.Token);
-        return response.Text ?? "";
+        cts.CancelAfter(TimeSpan.FromMinutes(minutes));
+        try
+        {
+            var response = await agent.RunAsync(prompt, cancellationToken: cts.Token);
+            return response.Text ?? "";
+        }
+        // Only our internal timer fired: report a real timeout instead of a bare
+        // "operation was canceled". A cancel on the caller's token is re-thrown as-is.
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"The agent did not finish within {minutes} minutes and was stopped. " +
+                "Try a simpler request, a faster model, or raise 'AgentTimeoutMinutes' in the worker settings.");
+        }
     }
 
     // Captures a reviewer's structured verdict submitted via the SubmitVerdict tool.
@@ -782,7 +866,7 @@ If their concerns are false, invalid, or impossible, output [REFUSED] followed b
             try
             {
                 await _connection.SendAsync("ReportWorkflowUpdate", workflowId, null, null, "Failed", null);
-                await _connection.SendAsync("ReportWorkflowLog", workflowId, "Error", $"Execution Error: {ex.Message}");
+                await _connection.SendAsync("ReportWorkflowLog", workflowId, "Error", DescribeError(ex));
             }
             catch {}
         }
