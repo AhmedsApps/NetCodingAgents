@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CodingAgents.Client/CodingAgents.Client.csproj" />
+    <Project Path="src/CodingAgents.MauiClient/CodingAgents.MauiClient.csproj" />
+    <Project Path="src/CodingAgents.Server/CodingAgents.Server.csproj" />
+    <Project Path="src/CodingAgents.Shared/CodingAgents.Shared.csproj" />
+    <Project Path="src/CodingAgents.WebClient/CodingAgents.WebClient.csproj" />
+    <Project Path="src/CodingAgents.Worker/CodingAgents.Worker.csproj" />
+  </Folder>
+</Solution>

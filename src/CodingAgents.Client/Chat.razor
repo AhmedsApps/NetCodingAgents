@@ -1,0 +1,1595 @@
+@using System.Text.RegularExpressions
+@using System.IO
+@implements IAsyncDisposable
+@inject NavigationManager NavigationManager
+
+@if (!_authenticated)
+{
+    <div class="login-overlay">
+        <div class="login-card">
+            <h1>🔒 Sign in</h1>
+            <p class="login-desc">Enter the app password to continue.</p>
+            <input class="login-input" type="password" placeholder="Password"
+                   @bind="_passwordInput" @bind:event="oninput" @onkeydown="HandleLoginKeyDown" />
+            <button class="new-chat-btn login-btn" @onclick="AttemptLogin"
+                    disabled="@(string.IsNullOrEmpty(_passwordInput) || _loggingIn)">
+                @(_loggingIn ? "Signing in..." : "Sign in")
+            </button>
+            @if (!string.IsNullOrEmpty(_loginError))
+            {
+                <div class="login-error">@_loginError</div>
+            }
+        </div>
+    </div>
+}
+else
+{
+<div class="app-layout">
+    <!-- Left Navigation Dock -->
+    <div class="nav-dock">
+        <button class="dock-item @(_activeTab == "chat" ? "active" : "")" 
+                title="Direct Chat" 
+                @onclick='() => SetActiveTab("chat")'>
+            <span class="dock-icon">💬</span>
+            <span class="dock-label">Chat</span>
+        </button>
+        <button class="dock-item @(_activeTab == "workflows" ? "active" : "")" 
+                title="Team Workflows" 
+                @onclick='() => SetActiveTab("workflows")'>
+            <span class="dock-icon">🏗️</span>
+            <span class="dock-label">Team</span>
+        </button>
+        <button class="dock-item @(_activeTab == "settings" ? "active" : "")" 
+                title="Settings" 
+                @onclick='() => SetActiveTab("settings")'>
+            <span class="dock-icon">⚙️</span>
+            <span class="dock-label">Settings</span>
+        </button>
+    </div>
+
+    <!-- MAIN VIEWPORT PANEL -->
+    <div class="main-viewport">
+        @if (_activeTab == "chat")
+        {
+            <!-- Tab 1: Direct Chat (Split Sidebar + Feed) -->
+            <div class="tab-split-container @(_mobileShowChat ? "show-chat" : "show-sidebar")">
+                <div class="sidebar">
+                    <div class="sidebar-header">
+                        <h3>💬 Sessions</h3>
+                        <button class="new-chat-btn" @onclick="CreateNewSession">
+                            ＋ New Chat
+                        </button>
+                    </div>
+                    <div class="sessions-list">
+                        @if (_sessions == null)
+                        {
+                            <div class="loading-state">Loading...</div>
+                        }
+                        else if (!_sessions.Any())
+                        {
+                            <div class="empty-state">No conversations yet.</div>
+                        }
+                        else
+                        {
+                            @foreach (var s in _sessions)
+                            {
+                                <div class="session-item @(s.Id == _selectedSessionId ? "active" : "")" 
+                                     @onclick="() => SelectSession(s.Id)">
+                                    <div class="session-title">@s.Title</div>
+                                    <div class="session-date">@s.CreatedAt.ToLocalTime().ToString("g")</div>
+                                </div>
+                            }
+                        }
+                    </div>
+                    <div class="sidebar-footer">
+                        <div class="status-indicator">
+                            <span class="dot @(_hubConnection?.State == HubConnectionState.Connected ? "connected" : "disconnected")"></span>
+                            <span>@(_hubConnection?.State == HubConnectionState.Connected ? "Server connected" : "Connecting...")</span>
+                        </div>
+                        <div class="status-indicator">
+                            <span class="dot @(_hubConnection?.State == HubConnectionState.Connected && _workerConnected ? "connected" : "disconnected")"></span>
+                            <span>@(_hubConnection?.State != HubConnectionState.Connected ? "Local agent unknown" : _workerConnected ? "Local agent online" : "Local agent offline")</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="chat-main">
+                    @if (_selectedSessionId == Guid.Empty)
+                    {
+                        <div class="welcome-container">
+                            <div class="welcome-card">
+                                <h1>🤖 Local Developer C# Agent</h1>
+                                <p>Start a session to inspect workspace directories, read/write files, and compile code locally.</p>
+                                <button class="new-chat-btn welcome-btn" @onclick="CreateNewSession">Start Chatting</button>
+                            </div>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="chat-header">
+                            <button class="mobile-back-btn" @onclick='() => _mobileShowChat = false'>
+                                ⬅ Sessions
+                            </button>
+                            <h2>@(_sessions?.FirstOrDefault(s => s.Id == _selectedSessionId)?.Title ?? "Active Chat")</h2>
+                            <div class="header-actions">
+                                <button class="toggle-logs-btn @(_showLogs ? "active" : "")" @onclick="ToggleLogs">
+                                    📋 Diagnostics
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="messages-container" id="messages-container">
+                            @if (_messages == null)
+                            {
+                                <div class="loading-state">Loading history...</div>
+                            }
+                            else
+                            {
+                                @foreach (var msg in _messages)
+                                {
+                                    <div class="message-row @(IsUserRole(msg.Role) ? "user-row" : "assistant-row")">
+                                        <div class="message-bubble">
+                                            @* REPLACE "You" with your preferred display name for user messages. *@
+                                            <div class="message-role">@(IsUserRole(msg.Role) ? "You" : "Agent")</div>
+                                            <div class="message-content">
+                                                @if (IsImageRole(msg.Role))
+                                                {
+                                                    <a href="@GetImageUrl(msg.Content)" target="_blank" rel="noopener">
+                                                        <img class="chat-image" src="@GetImageUrl(msg.Content)" alt="Attached image" />
+                                                    </a>
+                                                }
+                                                else if (IsFileRole(msg.Role))
+                                                {
+                                                    <a class="chat-file" href="@GetImageUrl(msg.Content)" target="_blank" rel="noopener" download>
+                                                        📄 @GetFileDisplayName(msg.Content)
+                                                    </a>
+                                                }
+                                                else
+                                                {
+                                                    @FormatMarkdown(msg.Content)
+                                                }
+                                            </div>
+                                            <div class="message-time">@msg.Timestamp.ToLocalTime().ToString("t")</div>
+                                        </div>
+                                    </div>
+                                }
+
+                                @if (_isAgentRunning)
+                                {
+                                    <div class="message-row assistant-row typing-row">
+                                        <div class="message-bubble typing-bubble">
+                                            <div class="message-role">Agent</div>
+                                            <div class="typing-indicator">
+                                                <span></span>
+                                                <span></span>
+                                                <span></span>
+                                            </div>
+                                            <div class="typing-text">Agent is running tools...</div>
+                                        </div>
+                                    </div>
+                                }
+                            }
+                        </div>
+
+                        <div class="input-container">
+                            <div class="quick-commands">
+                                @foreach (var cmd in _quickCommands)
+                                {
+                                    <button class="quick-cmd-btn"
+                                            title="@cmd.Prompt"
+                                            @onclick="() => SendQuickCommand(cmd.Prompt)"
+                                            disabled="@(_isAgentRunning || _hubConnection?.State != HubConnectionState.Connected)">
+                                        @cmd.Label
+                                    </button>
+                                }
+                            </div>
+                            <div class="input-box-wrapper">
+                                <label class="attach-btn" title="Attach a file to this conversation">
+                                    📎
+                                    <InputFile OnChange="OnFileSelected" style="display:none" />
+                                </label>
+                                <textarea class="chat-input"
+                                          placeholder="Ask the developer agent to write code, build, or run tests..."
+                                          @bind="_userInput"
+                                          @bind:event="oninput"
+                                          @onkeydown="HandleKeyDown"
+                                          disabled="@(_isAgentRunning || _hubConnection?.State != HubConnectionState.Connected)"></textarea>
+                                <button class="send-btn" 
+                                        @onclick="SendChatMessage"
+                                        disabled="@(string.IsNullOrWhiteSpace(_userInput) || _isAgentRunning || _hubConnection?.State != HubConnectionState.Connected)">
+                                    ➔
+                                </button>
+                            </div>
+                        </div>
+                    }
+                </div>
+
+                <!-- Live Agent log feed -->
+                @if (_showLogs && _selectedSessionId != Guid.Empty)
+                {
+                    <div class="logs-panel">
+                        <div class="logs-header">
+                            <h3>📋 Diagnostics</h3>
+                            <button class="clear-logs-btn" @onclick="ClearLogs">Clear</button>
+                        </div>
+                        <div class="logs-feed">
+                            @if (!_progressLogs.Any())
+                            {
+                                <div class="no-logs">No execution logs yet. Send a message to run tools.</div>
+                            }
+                            else
+                            {
+                                @foreach (var log in _progressLogs)
+                                {
+                                    <div class="log-item @log.Type.ToLower()">
+                                        <div class="log-meta">
+                                            <span class="log-tag">@log.Type</span>
+                                            <span class="log-time">@log.Timestamp.ToLocalTime().ToString("HH:mm:ss")</span>
+                                        </div>
+                                        <pre class="log-content">@log.Content</pre>
+                                    </div>
+                                }
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+        else if (_activeTab == "workflows")
+        {
+            <!-- Tab 2: Team Workflows -->
+            <div class="tab-split-container @(_mobileShowWorkflowDetail ? "show-chat" : "show-sidebar")">
+                <div class="sidebar">
+                    <div class="sidebar-header">
+                        <h3>🏗️ Development Tasks</h3>
+                        <div class="workflow-submit-box">
+                            <textarea class="workflow-input"
+                                      placeholder="Describe a development task..."
+                                      @bind="_workflowInput"
+                                      disabled="@(_hubConnection?.State != HubConnectionState.Connected)"></textarea>
+                            <input class="workflow-workspace-input"
+                                   placeholder="Working folder (optional, e.g. C:\Projects\MyApp)"
+                                   @bind="_workflowWorkspace"
+                                   disabled="@(_hubConnection?.State != HubConnectionState.Connected)" />
+                            <button class="new-chat-btn submit-workflow-btn"
+                                    @onclick="SubmitWorkflowTask"
+                                    disabled="@(string.IsNullOrWhiteSpace(_workflowInput) || _hubConnection?.State != HubConnectionState.Connected)">
+                                Submit Task
+                            </button>
+                        </div>
+                    </div>
+                    <div class="sessions-list">
+                        @if (_workflows == null)
+                        {
+                            <div class="loading-state">Loading tasks...</div>
+                        }
+                        else if (!_workflows.Any())
+                        {
+                            <div class="empty-state">No tasks submitted.</div>
+                        }
+                        else
+                        {
+                            @foreach (var w in _workflows)
+                            {
+                                <div class="session-item @(w.Id == _selectedWorkflowId ? "active" : "")" 
+                                     @onclick="() => SelectWorkflow(w.Id)">
+                                    <div class="session-title">@w.OriginalTask</div>
+                                    <div class="workflow-status-badge @w.Status.ToLower()">@w.Status</div>
+                                    <div class="session-date">@w.CreatedAt.ToLocalTime().ToString("g")</div>
+                                </div>
+                            }
+                        }
+                    </div>
+                </div>
+
+                <div class="chat-main workflow-main">
+                    @if (_selectedWorkflowId == Guid.Empty)
+                    {
+                        <div class="welcome-container">
+                            <div class="welcome-card">
+                                <h1>👥 Multi-Agent Software Team</h1>
+                                <p>Submit a development task. The System Analyst designs the plan, the Software Engineer reviews/optimizes it, and the Executor runs it (waiting automatically if rate limits are reached).</p>
+                            </div>
+                        </div>
+                    }
+                    else
+                    {
+                        @if (_selectedWorkflow == null)
+                        {
+                            <div class="loading-state">Loading task details...</div>
+                        }
+                        else
+                        {
+                            <div class="workflow-details-container">
+                                <div class="workflow-header-panel">
+                                    <button class="mobile-back-btn" @onclick='() => _mobileShowWorkflowDetail = false'>
+                                        ⬅ Tasks
+                                    </button>
+                                    <h2>Task Details</h2>
+                                    @if (_selectedWorkflow.Status == "AwaitingRetryConfirmation")
+                                    {
+                                        <span class="workflow-status-badge header-badge awaitingretryconfirmation" style="background: #e2a000; color: #fff; margin-right: 10px;">Awaiting Retry Confirmation</span>
+                                        <button class="btn btn-primary" style="padding: 5px 10px; font-size: 0.85em; margin-right: 5px;" @onclick="() => SubmitRetryDecision(true)">🔄 Yes, Retry</button>
+                                        <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.85em;" @onclick="() => SubmitRetryDecision(false)">🛑 No, Stop</button>
+                                    }
+                                    else
+                                    {
+                                        <span class="workflow-status-badge header-badge @_selectedWorkflow.Status.ToLower()">@_selectedWorkflow.Status</span>
+                                    }
+                                    @if (IsWorkflowRunning(_selectedWorkflow.Status))
+                                    {
+                                        <button class="stop-workflow-btn" @onclick="() => CancelWorkflow(_selectedWorkflow.Id)"
+                                                disabled="@(_hubConnection?.State != HubConnectionState.Connected)">
+                                            ⛔ Stop
+                                        </button>
+                                    }
+                                </div>
+
+                                @if (!string.IsNullOrEmpty(_selectedWorkflow.WorkspacePath))
+                                {
+                                    <div class="workflow-workspace-readout" title="Working directory">
+                                        📁 <code>@_selectedWorkflow.WorkspacePath</code>
+                                    </div>
+                                }
+
+                                <!-- Live agent interaction graph -->
+                                <div class="agent-graph-panel">
+                                    <div class="agent-graph-title">🕸️ Agent Pipeline</div>
+                                    <div class="agent-graph">
+                                        <div class="agent-node @NodeClass(PipelineStage.Task)">
+                                            <span class="agent-emoji">📋</span><span class="agent-name">Task</span>
+                                        </div>
+                                        <div class="agent-edge"></div>
+                                        <div class="agent-node @NodeClass(PipelineStage.Analyst)">
+                                            <span class="agent-emoji">🎨</span><span class="agent-name">Analyst</span>
+                                        </div>
+                                        <div class="agent-edge"></div>
+                                        <div class="agent-node @NodeClass(PipelineStage.Engineer)">
+                                            <span class="agent-emoji">🔍</span><span class="agent-name">Engineer</span>
+                                        </div>
+                                        <div class="agent-edge with-loop">
+                                            <span class="loop-label">↩ fixes</span>
+                                        </div>
+                                        <div class="agent-node @NodeClass(PipelineStage.Executor)">
+                                            <span class="agent-emoji">⚙️</span><span class="agent-name">Executor</span>
+                                        </div>
+                                        <div class="agent-edge"></div>
+                                        <div class="agent-node review-node @NodeClass(PipelineStage.Review)">
+                                            <span class="agent-emoji">🔬</span><span class="agent-name">Reviewers</span>
+                                            <div class="review-subnodes">
+                                                <span class="subnode">.NET</span>
+                                                <span class="subnode">Architect</span>
+                                            </div>
+                                        </div>
+                                        <div class="agent-edge"></div>
+                                        <div class="agent-node @NodeClass(PipelineStage.Complete)">
+                                            <span class="agent-emoji">@(_selectedWorkflow.Status == "Stalemate" || _selectedWorkflow.Status == "Failed" ? "⛔" : "✅")</span>
+                                            <span class="agent-name">@(_selectedWorkflow.Status == "Stalemate" ? "Stalemate" : _selectedWorkflow.Status == "Failed" ? "Failed" : "Done")</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="workflow-grid">
+                                    <!-- User Original Request -->
+                                    <div class="workflow-card-item">
+                                        <h4>📋 Original Task Request</h4>
+                                        <p class="raw-content">@_selectedWorkflow.OriginalTask</p>
+                                    </div>
+
+                                    <!-- System Analyst Design Plan -->
+                                    <div class="workflow-card-item">
+                                        <h4>🎨 System Analyst Design Plan</h4>
+                                        @if (string.IsNullOrEmpty(_selectedWorkflow.AnalystPlan))
+                                        {
+                                            <p class="muted-text">Design planning phase is pending...</p>
+                                        }
+                                        else
+                                        {
+                                            <div class="formatted-plan">
+                                                @FormatMarkdown(_selectedWorkflow.AnalystPlan)
+                                            </div>
+                                        }
+                                    </div>
+
+                                    <!-- Software Engineer Code Review / Prompt -->
+                                    <div class="workflow-card-item">
+                                        <h4>🔍 Software Engineer Code Review & Prompt</h4>
+                                        @if (string.IsNullOrEmpty(_selectedWorkflow.EngineerPlan))
+                                        {
+                                            <p class="muted-text">Code review and optimized prompt phase is pending...</p>
+                                        }
+                                        else
+                                        {
+                                            <div class="formatted-plan">
+                                                @FormatMarkdown(_selectedWorkflow.EngineerPlan)
+                                            </div>
+                                        }
+                                    </div>
+                                </div>
+
+                                <div class="workflow-followup-box">
+                                    <textarea class="workflow-input"
+                                              placeholder="Send a follow-up on this task (re-engages the team in the same folder)..."
+                                              @bind="_followUpInput"
+                                              disabled="@(_hubConnection?.State != HubConnectionState.Connected)"></textarea>
+                                    <button class="new-chat-btn submit-workflow-btn"
+                                            @onclick="() => SendFollowUp(_selectedWorkflow.Id)"
+                                            disabled="@(string.IsNullOrWhiteSpace(_followUpInput) || _hubConnection?.State != HubConnectionState.Connected)">
+                                        Send Follow-up
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                    }
+                </div>
+
+                <!-- Workflow Execution Log Feed -->
+                @if (_selectedWorkflowId != Guid.Empty)
+                {
+                    <div class="logs-panel workflow-logs">
+                        <div class="logs-header">
+                            <h3>📋 Execution Progress Logs</h3>
+                        </div>
+                        <div class="logs-feed">
+                            @if (!_workflowLogs.Any())
+                            {
+                                <div class="no-logs">Waiting for workflow to start executing...</div>
+                            }
+                            else
+                            {
+                                @foreach (var log in _workflowLogs)
+                                {
+                                    <div class="log-item @log.Stage.ToLower()">
+                                        <div class="log-meta">
+                                            <span class="log-tag">@log.Stage</span>
+                                            <span class="log-time">@log.Timestamp.ToLocalTime().ToString("HH:mm:ss")</span>
+                                        </div>
+                                        <pre class="log-content">@log.Message</pre>
+                                    </div>
+                                }
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+        else if (_activeTab == "settings")
+        {
+            <!-- Tab 3: System Settings -->
+            <div class="settings-container">
+                <div class="settings-card">
+                    <h2>⚙️ System Settings & Preferences</h2>
+                    <p class="settings-desc">Configure your remote execution executor and alerting service toggles. Changes are saved directly to the database.</p>
+
+                    @if (_dbSettings == null)
+                    {
+                        <div class="loading-state">Loading settings...</div>
+                    }
+                    else
+                    {
+                        <div class="settings-form">
+                            <!-- Tool Executor selection -->
+                            <div class="form-group">
+                                <label class="form-label">Default Code Executor Tool</label>
+                                <span class="form-help">Select the tool used to execute Software Engineer tasks in the workspace.</span>
+                                <select class="model-dropdown-select" @bind="UnifiedExecutorSelection">
+                                    <option value="ClaudeCode">Claude Code CLI (Anthropic Natively)</option>
+                                    @foreach (var config in _modelConfigs)
+                                    {
+                                        <option value="Antigravity:@config.Name">Antigravity Engine + @config.Name (@config.Provider)</option>
+                                    }
+                                </select>
+                            </div>
+
+                            <!-- Direct Chat Agent Model -->
+                            <div class="form-group">
+                                <label class="form-label">Direct Chat Agent Model</label>
+                                <span class="form-help">Select which configured model the direct chat service should use.</span>
+                                <select class="model-dropdown-select" @bind="_activeModel">
+                                    <option value="">-- Select Model --</option>
+                                    @foreach (var config in _modelConfigs)
+                                    {
+                                        <option value="@config.Name">@config.Name (@config.Provider)</option>
+                                    }
+                                </select>
+                            </div>
+
+                            <!-- Team Workflow Agent Models -->
+                            <div class="form-group">
+                                <label class="form-label">Multi-Agent Workflow Models</label>
+                                <span class="form-help">Configure specific models for the different workflow agents using format [Provider]:[ModelName] (e.g. Ollama:llama3.2:latest, OpenAI:gpt-4o)</span>
+                                
+                                <div class="form-grid">
+                                    <div class="input-row">
+                                        <label>System Analyst Model:</label>
+                                        <select class="model-dropdown-select" @bind="_dbSettings.AnalystModel">
+                                            <option value="">-- Select Model --</option>
+                                            @foreach (var config in _modelConfigs) { <option value="@config.Name">@config.Name (@config.Provider)</option> }
+                                        </select>
+                                    </div>
+                                    <div class="input-row">
+                                        <label>Software Engineer Model:</label>
+                                        <select class="model-dropdown-select" @bind="_dbSettings.EngineerModel">
+                                            <option value="">-- Select Model --</option>
+                                            @foreach (var config in _modelConfigs) { <option value="@config.Name">@config.Name (@config.Provider)</option> }
+                                        </select>
+                                    </div>
+                                    <div class="input-row">
+                                        <label>.NET Code Reviewer Model:</label>
+                                        <select class="model-dropdown-select" @bind="_dbSettings.DotNetReviewerModel">
+                                            <option value="">-- Select Model --</option>
+                                            @foreach (var config in _modelConfigs) { <option value="@config.Name">@config.Name (@config.Provider)</option> }
+                                        </select>
+                                    </div>
+                                    <div class="input-row">
+                                        <label>Architect Reviewer Model:</label>
+                                        <select class="model-dropdown-select" @bind="_dbSettings.ArchitectReviewerModel">
+                                            <option value="">-- Select Model --</option>
+                                            @foreach (var config in _modelConfigs) { <option value="@config.Name">@config.Name (@config.Provider)</option> }
+                                        </select>
+                                    </div>
+                                    <div class="input-row">
+                                        <label>Max Review Iterations:</label>
+                                        <input class="text-input" type="number" @bind="_dbSettings.MaxReviewIterations" min="1" max="10" />
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Model Configurations Manager -->
+                            <div class="form-group">
+                                <label class="form-label">Model Configurations</label>
+                                <span class="form-help">Manage your endpoints. You can add local Ollama instances, direct OpenAI/Anthropic APIs, or custom API endpoints.</span>
+                                
+                                @if (_isEditingModelConfig)
+                                {
+                                    <div class="model-config-editor">
+                                        <div class="form-grid">
+                                            <div class="input-row">
+                                                <label>Configuration Name:</label>
+                                                <input class="text-input" @bind="_editingModelConfig.Name" placeholder="e.g. Official Anthropic" />
+                                            </div>
+                                            <div class="input-row">
+                                                <label>Provider:</label>
+                                                <select class="model-dropdown-select" @bind="_editingModelConfig.Provider">
+                                                    <option value="Ollama">Ollama</option>
+                                                    <option value="OpenAI">OpenAI</option>
+                                                    <option value="Anthropic">Anthropic</option>
+                                                </select>
+                                            </div>
+                                            <div class="input-row">
+                                                <label>Base URL (Optional):</label>
+                                                <input class="text-input" @bind="_editingModelConfig.BaseUrl" placeholder="e.g. http://localhost:11434/ or https://api.anthropic.com/v1/" />
+                                                @if (_editingModelConfig.Provider == "Ollama")
+                                                {
+                                                    <div style="margin-top: 5px;">
+                                                        <button type="button" class="btn btn-secondary" @onclick="DiscoverLocalModels" disabled="@_loadingModels">
+                                                            @if (_loadingModels)
+                                                            {
+                                                                <span>Discovering...</span>
+                                                            }
+                                                            else
+                                                            {
+                                                                <span>Discover Models</span>
+                                                            }
+                                                        </button>
+                                                        @if (!string.IsNullOrEmpty(_modelLoadError))
+                                                        {
+                                                            <span style="color: #ff5c5c; font-size: 0.85em; margin-left: 10px;">@_modelLoadError</span>
+                                                        }
+                                                    </div>
+                                                }
+                                            </div>
+                                            <div class="input-row">
+                                                <label>Model Name:</label>
+                                                @if (_editingModelConfig.Provider == "Ollama" && _localModels.Any())
+                                                {
+                                                    <select class="model-dropdown-select" @bind="_editingModelConfig.ModelName">
+                                                        <option value="">-- Select a discovered model --</option>
+                                                        @foreach (var m in _localModels)
+                                                        {
+                                                            <option value="@m">@m</option>
+                                                        }
+                                                    </select>
+                                                }
+                                                else
+                                                {
+                                                    <input class="text-input" @bind="_editingModelConfig.ModelName" placeholder="e.g. claude-3-5-sonnet-latest" />
+                                                }
+                                            </div>
+                                            <div class="input-row">
+                                                <label>API Key (Optional):</label>
+                                                <input class="text-input" type="password" @bind="_editingModelConfig.ApiKey" placeholder="sk-..." />
+                                            </div>
+                                        </div>
+                                        <div class="config-actions" style="margin-top: 15px; display: flex; gap: 10px;">
+                                            <button type="button" class="btn btn-primary" @onclick="SaveModelConfig">Save Endpoint</button>
+                                            <button type="button" class="btn btn-secondary" @onclick="CancelEditModelConfig">Cancel</button>
+                                        </div>
+                                    </div>
+                                }
+                                else
+                                {
+                                    <div class="model-configs-list">
+                                        @if (_modelConfigs.Count == 0)
+                                        {
+                                            <div style="color: #8b92a5; padding: 10px 0;">No model configurations added yet.</div>
+                                        }
+                                        else
+                                        {
+                                            <table style="width: 100%; color: #e0e6ed; border-collapse: collapse; margin-bottom: 15px;">
+                                                <thead>
+                                                    <tr style="border-bottom: 1px solid #2b2e3c; text-align: left;">
+                                                        <th style="padding: 8px;">Name</th>
+                                                        <th style="padding: 8px;">Provider</th>
+                                                        <th style="padding: 8px;">Model</th>
+                                                        <th style="padding: 8px;">Actions</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    @foreach (var config in _modelConfigs)
+                                                    {
+                                                        <tr style="border-bottom: 1px solid #1c1e28;">
+                                                            <td style="padding: 8px;">@config.Name</td>
+                                                            <td style="padding: 8px;">@config.Provider</td>
+                                                            <td style="padding: 8px;">@config.ModelName</td>
+                                                            <td style="padding: 8px; display: flex; gap: 5px;">
+                                                                <button type="button" class="btn btn-secondary btn-sm" @onclick="() => EditModelConfig(config)">Edit</button>
+                                                                <button type="button" class="btn btn-danger btn-sm" @onclick="() => DeleteModelConfig(config.Id)">Delete</button>
+                                                            </td>
+                                                        </tr>
+                                                    }
+                                                </tbody>
+                                            </table>
+                                        }
+                                        <button type="button" class="btn btn-primary" @onclick="StartNewModelConfig">+ Add New Endpoint</button>
+                                    </div>
+                                }
+                            </div>
+
+                            <!-- Alert Toggles -->
+                            <div class="form-group">
+                                <label class="form-label">Alerting Channels</label>
+                                <span class="form-help">Enable or disable transition-aware alerts for Claude Desktop rate limits.</span>
+                                <div class="checkbox-wrapper">
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" @bind="_dbSettings.EnableWhatsApp" />
+                                        <span class="checkbox-text">Enable WhatsApp Notifications (CallMeBot API)</span>
+                                    </label>
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" @bind="_dbSettings.EnableEmail" />
+                                        <span class="checkbox-text">Enable Email Notifications & remote polling (SMTP/IMAP)</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <!-- App Password -->
+                            <div class="form-group">
+                                <label class="form-label">App Password</label>
+                                <span class="form-help">Change the password used to sign in to this app.</span>
+                                @if (_usingDefaultPassword)
+                                {
+                                    <div class="default-password-warning">
+                                        ⚠️ You are still using the default password. Please change it.
+                                    </div>
+                                }
+                                <div class="form-grid">
+                                    <div class="input-row">
+                                        <label>Current Password:</label>
+                                        <input class="text-input" type="password" @bind="_currentPassword" />
+                                    </div>
+                                    <div class="input-row">
+                                        <label>New Password:</label>
+                                        <input class="text-input" type="password" @bind="_newPassword" />
+                                    </div>
+                                    <div class="input-row">
+                                        <label>Confirm New Password:</label>
+                                        <input class="text-input" type="password" @bind="_confirmPassword" />
+                                    </div>
+                                </div>
+                                <button type="button" class="btn btn-primary" style="margin-top: 12px;"
+                                        @onclick="ChangePassword"
+                                        disabled="@(string.IsNullOrEmpty(_currentPassword) || string.IsNullOrEmpty(_newPassword))">
+                                    Change Password
+                                </button>
+                                @if (!string.IsNullOrEmpty(_passwordMessage))
+                                {
+                                    <div class="password-message @(_passwordChangeFailed ? "error" : "success")">
+                                        @_passwordMessage
+                                    </div>
+                                }
+                            </div>
+
+                            <button class="save-settings-btn" @onclick="SaveSettings">
+                                Save Preferences
+                            </button>
+
+                            @if (!string.IsNullOrEmpty(_settingsMessage))
+                            {
+                                <div class="settings-toast success">
+                                    @_settingsMessage
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+    </div>
+</div>
+}
+
+@code {
+    [Parameter] public string ServerUrl { get; set; } = "https://localhost:7150";
+
+    private HubConnection? _hubConnection;
+    private string _activeTab = "chat";
+
+    // Whether a local PC agent worker is registered with the server. This is distinct
+    // from the client<->server hub connection (_hubConnection.State).
+    private bool _workerConnected = false;
+
+    // Base URL of the server, used to resolve relative artifact/image URLs.
+    private string _serverBaseUrl = string.Empty;
+
+    // App access password gate
+    private bool _authenticated = false;
+    // Session token from Login, used to re-authenticate the connection after a reconnect.
+    private string _authToken = string.Empty;
+    // Short-lived capability token appended to /artifacts URLs so images/files can load.
+    private string _artifactToken = string.Empty;
+    private string _passwordInput = string.Empty;
+    private string _loginError = string.Empty;
+    private bool _loggingIn = false;
+    private bool _usingDefaultPassword = false;
+
+    // Change-password form (Settings tab)
+    private string _currentPassword = string.Empty;
+    private string _newPassword = string.Empty;
+    private string _confirmPassword = string.Empty;
+    private string _passwordMessage = string.Empty;
+    private bool _passwordChangeFailed = false;
+
+    // Direct Chat Fields
+    private List<ConversationSession>? _sessions;
+    private List<PersistedMessage>? _messages;
+    private List<AgentProgressDto> _progressLogs = new();
+    private Guid _selectedSessionId = Guid.Empty;
+    private string _userInput = string.Empty;
+    private bool _isAgentRunning = false;
+    private bool _showLogs = true;
+
+    // Team Workflows Fields
+    private List<WorkflowDto>? _workflows;
+    private List<WorkflowLogDto> _workflowLogs = new();
+    private Guid _selectedWorkflowId = Guid.Empty;
+    private WorkflowDto? _selectedWorkflow;
+    private string _workflowInput = string.Empty;
+    private string _workflowWorkspace = string.Empty;
+    private string _followUpInput = string.Empty;
+
+    // Settings Fields
+    private SystemSettings? _dbSettings;
+    private string _settingsMessage = string.Empty;
+
+    private string UnifiedExecutorSelection
+    {
+        get
+        {
+            if (_dbSettings == null) return "";
+            if (_dbSettings.DefaultExecutor == "ClaudeCode")
+                return "ClaudeCode";
+            if (_dbSettings.DefaultExecutor == "Antigravity" && !string.IsNullOrEmpty(_dbSettings.ExecutorModel))
+                return $"Antigravity:{_dbSettings.ExecutorModel}";
+            return "Antigravity:"; // fallback
+        }
+        set
+        {
+            if (_dbSettings == null) return;
+            if (value == "ClaudeCode")
+            {
+                _dbSettings.DefaultExecutor = "ClaudeCode";
+            }
+            else if (value.StartsWith("Antigravity:"))
+            {
+                _dbSettings.DefaultExecutor = "Antigravity";
+                _dbSettings.ExecutorModel = value.Substring("Antigravity:".Length);
+            }
+        }
+    }
+    
+    // Model Configuration Fields
+    private List<ModelConfiguration> _modelConfigs = new();
+    private ModelConfiguration _editingModelConfig = new();
+    private bool _isEditingModelConfig = false;
+
+    // Local Model Configuration Fields
+    private List<string> _localModels = new();
+    private string _activeModel = string.Empty;
+    private bool _loadingModels = false;
+    private string _modelLoadError = string.Empty;
+
+    // Mobile View Toggle States
+    private bool _mobileShowChat = false;
+    private bool _mobileShowWorkflowDetail = false;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var baseUri = string.IsNullOrEmpty(ServerUrl) ? NavigationManager.BaseUri : ServerUrl;
+        _serverBaseUrl = baseUri.TrimEnd('/');
+        var hubUrl = $"{_serverBaseUrl}/chathub";
+        _hubConnection = new HubConnectionBuilder()
+            .WithUrl(hubUrl)
+            .WithAutomaticReconnect()
+            .Build();
+
+        _hubConnection.Reconnected += async (connectionId) =>
+        {
+            // A reconnect is a brand-new connection on the server, so it starts
+            // unauthenticated. Re-authenticate before any other call.
+            if (!string.IsNullOrEmpty(_authToken))
+            {
+                try
+                {
+                    if (!await _hubConnection.InvokeAsync<bool>("Authenticate", _authToken))
+                    {
+                        // Token expired or revoked (e.g. the password changed) — back to login.
+                        _authenticated = false;
+                        _authToken = string.Empty;
+                        _loginError = "Your session expired. Please sign in again.";
+                        await InvokeAsync(StateHasChanged);
+                        return;
+                    }
+                }
+                catch
+                {
+                    _authenticated = false;
+                    await InvokeAsync(StateHasChanged);
+                    return;
+                }
+            }
+
+            if (_selectedSessionId != Guid.Empty)
+            {
+                await _hubConnection.InvokeAsync("JoinSession", _selectedSessionId.ToString());
+            }
+            if (_selectedWorkflowId != Guid.Empty)
+            {
+                await _hubConnection.InvokeAsync("JoinSession", _selectedWorkflowId.ToString());
+            }
+            await RefreshArtifactToken();
+            await RefreshWorkerStatus();
+            await InvokeAsync(StateHasChanged);
+        };
+
+        _hubConnection.Reconnecting += (error) =>
+        {
+            // We can no longer trust the cached worker state while disconnected.
+            _workerConnected = false;
+            InvokeAsync(StateHasChanged);
+            return Task.CompletedTask;
+        };
+
+        // Live worker online/offline updates broadcast by the server.
+        _hubConnection.On<bool>("WorkerStatusChanged", (connected) =>
+        {
+            _workerConnected = connected;
+            InvokeAsync(StateHasChanged);
+        });
+
+        // 1. Direct Chat listeners
+        _hubConnection.On<ChatMessageDto>("ReceiveMessage", (dto) =>
+        {
+            if (dto.SessionId == _selectedSessionId)
+            {
+                _messages ??= new();
+                if (!_messages.Any(m => m.Timestamp == dto.Timestamp && m.Role == dto.Role))
+                {
+                    _messages.Add(new PersistedMessage
+                    {
+                        SessionId = dto.SessionId,
+                        Role = dto.Role,
+                        Content = dto.Content,
+                        Timestamp = dto.Timestamp
+                    });
+                }
+                if (dto.Role == "Assistant")
+                {
+                    _isAgentRunning = false;
+                }
+                InvokeAsync(StateHasChanged);
+            }
+        });
+
+        _hubConnection.On<AgentProgressDto>("ReceiveProgress", (dto) =>
+        {
+            if (dto.SessionId == _selectedSessionId)
+            {
+                _progressLogs.Add(dto);
+                if (dto.Type == "Error")
+                {
+                    _isAgentRunning = false;
+                }
+                InvokeAsync(StateHasChanged);
+            }
+        });
+
+        // 2. Team Workflows listeners
+        _hubConnection.On<WorkflowLogDto>("ReceiveWorkflowLog", (dto) =>
+        {
+            if (dto.WorkflowId == _selectedWorkflowId)
+            {
+                _workflowLogs.Add(dto);
+                InvokeAsync(StateHasChanged);
+            }
+        });
+
+        // Direct state push: updates the open task detail and its pipeline graph in place,
+        // in lockstep with the log feed, without a re-fetch round-trip.
+        _hubConnection.On<WorkflowDto>("ReceiveWorkflowState", (dto) =>
+        {
+            if (_workflows != null)
+            {
+                var idx = _workflows.FindIndex(w => w.Id == dto.Id);
+                if (idx >= 0) _workflows[idx] = dto;
+            }
+            if (dto.Id == _selectedWorkflowId)
+            {
+                _selectedWorkflow = dto;
+            }
+            InvokeAsync(StateHasChanged);
+        });
+
+        _hubConnection.On("ReceiveWorkflowUpdate", async () =>
+        {
+            // Detail + graph are kept current by ReceiveWorkflowState; here we only refresh
+            // the list so newly created or removed workflows appear.
+            await LoadWorkflows();
+        });
+
+        try
+        {
+            await _hubConnection.StartAsync();
+            // Data is loaded after a successful sign-in (see AttemptLogin).
+        }
+        catch (Exception ex)
+        {
+            _progressLogs.Add(new AgentProgressDto
+            {
+                Type = "Error",
+                Content = $"Startup Connection Error: Could not connect to backend server. Details: {ex.Message}"
+            });
+            StateHasChanged();
+        }
+    }
+
+    private async Task HandleLoginKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await AttemptLogin();
+    }
+
+    private async Task AttemptLogin()
+    {
+        if (_hubConnection == null || string.IsNullOrEmpty(_passwordInput)) return;
+
+        _loggingIn = true;
+        _loginError = string.Empty;
+        StateHasChanged();
+
+        try
+        {
+            var token = await _hubConnection.InvokeAsync<string?>("Login", _passwordInput);
+            if (!string.IsNullOrEmpty(token))
+            {
+                _authToken = token;
+                _authenticated = true;
+                _passwordInput = string.Empty;
+
+                try { _usingDefaultPassword = await _hubConnection.InvokeAsync<bool>("IsDefaultPassword"); }
+                catch { _usingDefaultPassword = false; }
+
+                await RefreshArtifactToken();
+
+                await RefreshWorkerStatus();
+                await LoadSessions();
+                await LoadWorkflows();
+                await LoadSettings();
+            }
+            else
+            {
+                _loginError = "Incorrect password.";
+            }
+        }
+        catch (Exception ex)
+        {
+            _loginError = $"Could not sign in: {ex.Message}";
+        }
+        finally
+        {
+            _loggingIn = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ChangePassword()
+    {
+        if (_hubConnection == null) return;
+
+        _passwordMessage = string.Empty;
+        _passwordChangeFailed = false;
+
+        if (_newPassword != _confirmPassword)
+        {
+            _passwordMessage = "The new passwords do not match.";
+            _passwordChangeFailed = true;
+            StateHasChanged();
+            return;
+        }
+
+        try
+        {
+            var error = await _hubConnection.InvokeAsync<string?>("ChangePassword", _currentPassword, _newPassword);
+            if (error == null)
+            {
+                _passwordMessage = "Password changed successfully.";
+                _passwordChangeFailed = false;
+                _currentPassword = _newPassword = _confirmPassword = string.Empty;
+                _usingDefaultPassword = false;
+            }
+            else
+            {
+                _passwordMessage = error;
+                _passwordChangeFailed = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _passwordMessage = $"Error changing password: {ex.Message}";
+            _passwordChangeFailed = true;
+        }
+        StateHasChanged();
+    }
+
+    private async Task RefreshArtifactToken()
+    {
+        if (_hubConnection == null) return;
+        try { _artifactToken = await _hubConnection.InvokeAsync<string>("GetArtifactToken"); }
+        catch { _artifactToken = string.Empty; }
+    }
+
+    private async Task RefreshWorkerStatus()
+    {
+        if (_hubConnection == null) return;
+        try
+        {
+            _workerConnected = await _hubConnection.InvokeAsync<bool>("IsWorkerConnected");
+        }
+        catch
+        {
+            _workerConnected = false;
+        }
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task SetActiveTab(string tab)
+    {
+        _activeTab = tab;
+        _settingsMessage = string.Empty;
+        _mobileShowChat = false;
+        _mobileShowWorkflowDetail = false;
+        StateHasChanged();
+
+        if (tab == "chat")
+        {
+            await LoadSessions();
+        }
+        else if (tab == "workflows")
+        {
+            await LoadWorkflows();
+        }
+        else if (tab == "settings")
+        {
+            await LoadSettings();
+        }
+    }
+
+    // Direct Chat Methods
+    private async Task LoadSessions()
+    {
+        if (_hubConnection != null)
+        {
+            _sessions = await _hubConnection.InvokeAsync<List<ConversationSession>>("GetSessions");
+            StateHasChanged();
+        }
+    }
+
+    private async Task SelectSession(Guid sessionId)
+    {
+        if (_selectedSessionId != Guid.Empty && _hubConnection != null)
+        {
+            await _hubConnection.InvokeAsync("LeaveSession", _selectedSessionId.ToString());
+        }
+
+        _selectedSessionId = sessionId;
+        _messages = null;
+        _progressLogs.Clear();
+        _isAgentRunning = false;
+        _mobileShowChat = true;
+        StateHasChanged();
+
+        if (_hubConnection != null)
+        {
+            // Keep the artifact token fresh so images in this session's history still load.
+            await RefreshArtifactToken();
+            await _hubConnection.InvokeAsync("JoinSession", sessionId.ToString());
+            var allMessages = await _hubConnection.InvokeAsync<List<PersistedMessage>>("GetMessages", sessionId);
+            _messages = allMessages.Where(m => !m.Role.StartsWith("Progress:")).ToList();
+            _progressLogs = allMessages
+                .Where(m => m.Role.StartsWith("Progress:"))
+                .Select(m => new AgentProgressDto
+                {
+                    SessionId = sessionId,
+                    Type = m.Role.Substring("Progress:".Length),
+                    Content = m.Content,
+                    Timestamp = m.Timestamp
+                })
+                .ToList();
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task CreateNewSession()
+    {
+        if (_hubConnection != null)
+        {
+            var session = await _hubConnection.InvokeAsync<ConversationSession>("CreateSession", "");
+            await LoadSessions();
+            await SelectSession(session.Id);
+        }
+    }
+
+    private async Task SendChatMessage()
+    {
+        if (string.IsNullOrWhiteSpace(_userInput) || _selectedSessionId == Guid.Empty || _hubConnection == null)
+            return;
+
+        var prompt = _userInput;
+        _userInput = string.Empty;
+        _isAgentRunning = true;
+        StateHasChanged();
+
+        try
+        {
+            await _hubConnection.InvokeAsync("SendMessage", _selectedSessionId, prompt);
+        }
+        catch (Exception ex)
+        {
+            _progressLogs.Add(new AgentProgressDto
+            {
+                SessionId = _selectedSessionId,
+                Type = "Error",
+                Content = $"Failed sending: {ex.Message}"
+            });
+            _isAgentRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey)
+        {
+            await SendChatMessage();
+        }
+    }
+
+    private const long MaxUploadBytes = 10 * 1024 * 1024; // 10 MB (base64 stays under the hub cap)
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        if (_selectedSessionId == Guid.Empty || _hubConnection == null
+            || _hubConnection.State != HubConnectionState.Connected)
+        {
+            return;
+        }
+
+        var file = e.File;
+        if (file == null) return;
+
+        if (file.Size > MaxUploadBytes)
+        {
+            _progressLogs.Add(new AgentProgressDto
+            {
+                SessionId = _selectedSessionId,
+                Type = "Error",
+                Content = $"'{file.Name}' is too large ({file.Size / (1024 * 1024)} MB). The maximum upload size is 10 MB."
+            });
+            StateHasChanged();
+            return;
+        }
+
+        try
+        {
+            using var stream = file.OpenReadStream(MaxUploadBytes);
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+            var base64 = Convert.ToBase64String(ms.ToArray());
+            await _hubConnection.InvokeAsync("UploadChatFile", _selectedSessionId, file.Name, base64);
+        }
+        catch (Exception ex)
+        {
+            _progressLogs.Add(new AgentProgressDto
+            {
+                SessionId = _selectedSessionId,
+                Type = "Error",
+                Content = $"Upload failed: {ex.Message}"
+            });
+            StateHasChanged();
+        }
+    }
+
+    // Roles: "User" text, "UserImage"/"UserFile" uploads from the user, "Image" agent images.
+    private static bool IsUserRole(string role) => role is "User" or "UserImage" or "UserFile";
+    private static bool IsImageRole(string role) => role is "Image" or "UserImage";
+    private static bool IsFileRole(string role) => role is "UserFile" or "File";
+
+    private static string GetFileDisplayName(string content)
+    {
+        var name = content;
+        var slash = name.LastIndexOf('/');
+        if (slash >= 0) name = name.Substring(slash + 1);
+        // Strip the "yyyyMMdd_HHmmssfff_" prefix the server adds for uniqueness.
+        var m = Regex.Match(name, @"^\d{8}_\d{9}_(.+)$");
+        return m.Success ? m.Groups[1].Value : name;
+    }
+
+    // One-click prompts that drive the agent's tools (screenshot, build, tests, etc.).
+    private record QuickCommand(string Label, string Prompt);
+
+    private static readonly List<QuickCommand> _quickCommands = new()
+    {
+        new("📸 Screenshot", "Take a screenshot of my screen and save it to the workspace as screenshot.png, then tell me the saved file name."),
+        new("🔨 Build", "Run 'dotnet build' on the solution and report any errors or warnings concisely."),
+        new("🧪 Test", "Run 'dotnet test' and summarize which tests passed and which failed."),
+        new("📂 List Files", "List the files in the project workspace so I can see the current structure."),
+        new("🌿 Git Status", "Run 'git status' and summarize the current uncommitted changes."),
+    };
+
+    private async Task SendQuickCommand(string prompt)
+    {
+        if (_selectedSessionId == Guid.Empty || _hubConnection == null
+            || _isAgentRunning || _hubConnection.State != HubConnectionState.Connected)
+        {
+            return;
+        }
+
+        _userInput = prompt;
+        await SendChatMessage();
+    }
+
+    private void ToggleLogs()
+    {
+        _showLogs = !_showLogs;
+    }
+
+    private void ClearLogs()
+    {
+        _progressLogs.Clear();
+    }
+
+    // Team Workflows Methods
+    private async Task LoadWorkflows()
+    {
+        if (_hubConnection != null)
+        {
+            _workflows = await _hubConnection.InvokeAsync<List<WorkflowDto>>("GetWorkflows");
+            StateHasChanged();
+        }
+    }
+
+    private async Task SelectWorkflow(Guid workflowId)
+    {
+        if (_selectedWorkflowId != Guid.Empty && _hubConnection != null)
+        {
+            await _hubConnection.InvokeAsync("LeaveSession", _selectedWorkflowId.ToString());
+        }
+
+        _selectedWorkflowId = workflowId;
+        _workflowLogs.Clear();
+        _selectedWorkflow = null;
+        _mobileShowWorkflowDetail = true;
+        StateHasChanged();
+
+        if (_hubConnection != null)
+        {
+            await _hubConnection.InvokeAsync("JoinSession", workflowId.ToString());
+            var list = await _hubConnection.InvokeAsync<List<WorkflowDto>>("GetWorkflows");
+            _selectedWorkflow = list.FirstOrDefault(w => w.Id == workflowId);
+            _workflowLogs = await _hubConnection.InvokeAsync<List<WorkflowLogDto>>("GetWorkflowLogs", workflowId);
+            StateHasChanged();
+        }
+    }
+
+    private async Task SubmitWorkflowTask()
+    {
+        if (string.IsNullOrWhiteSpace(_workflowInput) || _hubConnection == null)
+            return;
+
+        var task = _workflowInput;
+        var workspace = _workflowWorkspace;
+        _workflowInput = string.Empty;
+        _workflowWorkspace = string.Empty;
+        StateHasChanged();
+
+        try
+        {
+            var created = await _hubConnection.InvokeAsync<WorkflowDto>("SubmitWorkflow", task, workspace);
+            await LoadWorkflows();
+            await SelectWorkflow(created.Id);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error submitting workflow: {ex.Message}");
+        }
+    }
+
+    private static bool IsWorkflowRunning(string status)
+        => status is not ("Completed" or "Failed" or "Stalemate" or "Cancelled");
+
+    private async Task CancelWorkflow(Guid workflowId)
+    {
+        if (_hubConnection == null) return;
+        try { await _hubConnection.InvokeAsync("CancelWorkflow", workflowId); }
+        catch (Exception ex) { Console.WriteLine($"Error cancelling workflow: {ex.Message}"); }
+    }
+
+    private async Task SubmitRetryDecision(bool retry)
+    {
+        if (_hubConnection == null || _selectedWorkflowId == Guid.Empty) return;
+        try { await _hubConnection.InvokeAsync("SubmitRetryDecision", _selectedWorkflowId, retry); }
+        catch (Exception ex) { Console.WriteLine($"Error submitting retry decision: {ex.Message}"); }
+    }
+
+    private async Task SendFollowUp(Guid workflowId)
+    {
+        if (_hubConnection == null || string.IsNullOrWhiteSpace(_followUpInput)) return;
+        var message = _followUpInput;
+        _followUpInput = string.Empty;
+        StateHasChanged();
+        try { await _hubConnection.InvokeAsync("SendWorkflowFollowUp", workflowId, message); }
+        catch (Exception ex) { Console.WriteLine($"Error sending follow-up: {ex.Message}"); }
+    }
+
+    // Agent pipeline graph — derives the active stage from the workflow's status and
+    // which plans have been produced, so the nodes light up live as agents hand off.
+    private enum PipelineStage { Task = 0, Analyst = 1, Engineer = 2, Executor = 3, Review = 4, Complete = 5 }
+
+    private (PipelineStage active, bool isError, bool isDone) GetPipelineState()
+    {
+        var wf = _selectedWorkflow;
+        if (wf == null) return (PipelineStage.Task, false, false);
+
+        var status = wf.Status ?? "";
+        if (status == "Completed") return (PipelineStage.Complete, false, true);
+        if (status == "Failed" || status == "Stalemate") return (PipelineStage.Complete, true, false);
+        if (status == "AwaitingRetryConfirmation") return (PipelineStage.Review, false, false);
+        if (status == "Pending" || status == "Queued") return (PipelineStage.Task, false, false);
+
+        // In progress: use produced plans to know how far we've got, then the status
+        // string to pinpoint the current loop phase.
+        if (string.IsNullOrWhiteSpace(wf.AnalystPlan)) return (PipelineStage.Analyst, false, false);
+        if (string.IsNullOrWhiteSpace(wf.EngineerPlan)) return (PipelineStage.Engineer, false, false);
+
+        if (status.StartsWith("Reviewing")) return (PipelineStage.Review, false, false);
+        if (status.StartsWith("Validating")) return (PipelineStage.Engineer, false, false);
+        return (PipelineStage.Executor, false, false); // "Applying Fixes" / "Executing"
+    }
+
+    private string NodeClass(PipelineStage node)
+    {
+        var (active, isError, isDone) = GetPipelineState();
+        if (isError) return node == active ? "error" : (node < active ? "done" : "pending");
+        if (isDone) return "done";
+        if (node < active) return "done";
+        if (node == active) return "active";
+        return "pending";
+    }
+
+    // Settings Methods
+    private async Task LoadSettings()
+    {
+        if (_hubConnection != null)
+        {
+            _dbSettings = await _hubConnection.InvokeAsync<SystemSettings>("GetSettings");
+            _modelConfigs = await _hubConnection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations");
+            StateHasChanged();
+        }
+    }
+
+    private async Task DiscoverLocalModels()
+    {
+        if (_hubConnection != null)
+        {
+            _loadingModels = true;
+            _modelLoadError = string.Empty;
+            _localModels.Clear();
+            StateHasChanged();
+            try
+            {
+                _localModels = await _hubConnection.InvokeAsync<List<string>>("GetLocalModels", _editingModelConfig.BaseUrl);
+                if (!_localModels.Any())
+                {
+                    _modelLoadError = "No models found at this URL.";
+                }
+            }
+            catch (Exception ex)
+            {
+                _modelLoadError = $"Could not retrieve models: {ex.Message}";
+            }
+            finally
+            {
+                _loadingModels = false;
+                StateHasChanged();
+            }
+        }
+    }
+
+    private async Task SaveSettings()
+    {
+        if (_hubConnection != null && _dbSettings != null)
+        {
+            try
+            {
+                await _hubConnection.InvokeAsync<SystemSettings>("SaveSettings", _dbSettings);
+
+                if (!string.IsNullOrEmpty(_activeModel) && _activeModel != "Error retrieving model" && _activeModel != "No active worker connected" && !_activeModel.StartsWith("Error loading models"))
+                {
+                    await _hubConnection.InvokeAsync("SaveActiveModel", _activeModel);
+                }
+
+                _settingsMessage = "Settings and local model saved successfully!";
+            }
+            catch (Exception ex)
+            {
+                _settingsMessage = $"Error saving: {ex.Message}";
+            }
+            StateHasChanged();
+
+            await Task.Delay(3000);
+            _settingsMessage = string.Empty;
+            StateHasChanged();
+        }
+    }
+
+    private void StartNewModelConfig()
+    {
+        _editingModelConfig = new ModelConfiguration();
+        _isEditingModelConfig = true;
+    }
+
+    private void EditModelConfig(ModelConfiguration config)
+    {
+        _editingModelConfig = new ModelConfiguration
+        {
+            Id = config.Id,
+            Name = config.Name,
+            Provider = config.Provider,
+            ModelName = config.ModelName,
+            BaseUrl = config.BaseUrl,
+            ApiKey = config.ApiKey
+        };
+        _isEditingModelConfig = true;
+    }
+
+    private async Task SaveModelConfig()
+    {
+        if (_hubConnection != null)
+        {
+            await _hubConnection.InvokeAsync("SaveModelConfiguration", _editingModelConfig);
+            _modelConfigs = await _hubConnection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations");
+            _isEditingModelConfig = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task DeleteModelConfig(Guid id)
+    {
+        if (_hubConnection != null)
+        {
+            await _hubConnection.InvokeAsync("DeleteModelConfiguration", id);
+            _modelConfigs = await _hubConnection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations");
+            StateHasChanged();
+        }
+    }
+
+    private void CancelEditModelConfig()
+    {
+        _isEditingModelConfig = false;
+        StateHasChanged();
+    }
+
+    private string GetImageUrl(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return content;
+        if (content.StartsWith("http", StringComparison.OrdinalIgnoreCase)) return content;
+        // /artifacts is access-controlled; the browser can't send hub credentials on an
+        // <img> request, so append the short-lived artifact token.
+        var url = $"{_serverBaseUrl}{content}";
+        return string.IsNullOrEmpty(_artifactToken) ? url : $"{url}?t={_artifactToken}";
+    }
+
+    private MarkupString FormatMarkdown(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return new MarkupString();
+
+        var escaped = System.Net.WebUtility.HtmlEncode(text);
+        
+        var parts = escaped.Split("```");
+        var sb = new System.Text.StringBuilder();
+
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (i % 2 == 1) // Code block
+            {
+                var blockContent = parts[i];
+                var firstLineBreak = blockContent.IndexOf('\n');
+                var lang = "code";
+                var code = blockContent;
+                if (firstLineBreak != -1)
+                {
+                    lang = blockContent.Substring(0, firstLineBreak).Trim();
+                    code = blockContent.Substring(firstLineBreak + 1);
+                }
+                sb.Append($"<pre class=\"code-block\"><div class=\"code-header\">{lang}</div><code>{code}</code></pre>");
+            }
+            else // Normal text paragraph
+            {
+                var lines = parts[i].Split('\n');
+                foreach (var line in lines)
+                {
+                    var trimmed = line.Trim();
+                    if (trimmed.StartsWith("- ") || trimmed.StartsWith("* "))
+                    {
+                        sb.Append($"<li>{trimmed.Substring(2)}</li>");
+                    }
+                    else if (trimmed.StartsWith("### "))
+                    {
+                        sb.Append($"<h3>{trimmed.Substring(4)}</h3>");
+                    }
+                    else if (trimmed.StartsWith("## "))
+                    {
+                        sb.Append($"<h2>{trimmed.Substring(3)}</h2>");
+                    }
+                    else if (trimmed.StartsWith("# "))
+                    {
+                        sb.Append($"<h1>{trimmed.Substring(2)}</h1>");
+                    }
+                    else if (!string.IsNullOrWhiteSpace(trimmed))
+                    {
+                        // Bold parsing: **text**
+                        var processedLine = Regex.Replace(trimmed, @"\*\*(.*?)\*\*", "<strong>$1</strong>");
+                        // Inline code: `code`
+                        processedLine = Regex.Replace(processedLine, @"`(.*?)`", "<code class=\"inline-code\">$1</code>");
+                        sb.Append($"<p>{processedLine}</p>");
+                    }
+                }
+            }
+        }
+        return new MarkupString(sb.ToString());
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hubConnection != null)
+        {
+            if (_selectedSessionId != Guid.Empty)
+            {
+                await _hubConnection.InvokeAsync("LeaveSession", _selectedSessionId.ToString());
+            }
+            if (_selectedWorkflowId != Guid.Empty)
+            {
+                await _hubConnection.InvokeAsync("LeaveSession", _selectedWorkflowId.ToString());
+            }
+            await _hubConnection.DisposeAsync();
+        }
+    }
+}

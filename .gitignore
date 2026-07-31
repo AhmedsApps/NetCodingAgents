@@ -1,0 +1,62 @@
+## Build output
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+
+## Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## Publish profiles — these contain deployment credentials, never commit them
+**/Properties/PublishProfiles/*.pubxml
+**/Properties/PublishProfiles/*.pubxml.user
+**/Properties/PublishProfiles/*.PublishSettings
+PublishScripts/
+
+## Secrets and environment-specific configuration
+appsettings.Production.json
+appsettings.*.Local.json
+*.env
+.env
+
+## Databases and agent-generated data
+*.db
+*.db-shm
+*.db-wal
+*.mdf
+*.ldf
+artifacts/
+
+## NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+project.lock.json
+project.fragment.lock.json
+
+## MAUI / mobile
+*.keystore
+*.jks
+*.mobileprovision
+*.p12
+
+## OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+## Misc
+*.cache
+*.tmp
+*.bak
+TestResults/
+BenchmarkDotNet.Artifacts/

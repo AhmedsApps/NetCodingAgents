@@ -1,0 +1,15 @@
+@page "/"
+@using CodingAgents.Client
+
+<Chat ServerUrl="@ServerUrl" />
+
+@code {
+    // Base URL of the CodingAgents server (the app that hosts /chathub).
+#if DEBUG
+    // REPLACE WITH: the URL your server listens on while developing locally.
+    private string ServerUrl = "http://localhost:5111";
+#else
+    // REPLACE WITH: your deployed server URL, e.g. "https://chat.example.com/"
+    private string ServerUrl = "https://localhost:7150/";
+#endif
+}

@@ -1,0 +1,9 @@
+@page "/"
+@using CodingAgents.Client
+@using Microsoft.Extensions.Configuration
+@inject IConfiguration Configuration
+@rendermode InteractiveServer
+
+<PageTitle>Agent Chat</PageTitle>
+
+<Chat ServerUrl="@Configuration["ServerUrl"]" />
