@@ -5,15 +5,32 @@
 [Ll]og/
 [Ll]ogs/
 
-## Visual Studio / Rider / VS Code
+## Visual Studio / Rider / VS Code — local IDE state, never share
 .vs/
+**/.vs/
 .vscode/
+**/.vscode/
 .idea/
+**/.idea/
 *.user
 *.suo
 *.userosscache
 *.sln.docstates
 *.userprefs
+*.slnLaunch.user
+*.DotSettings.user
+
+## AI assistant / tooling folders — local config and transcripts, never share
+.claude/
+**/.claude/
+CLAUDE.md
+.cursor/
+**/.cursor/
+.aider*
+.github/copilot-instructions.md
+.continue/
+.windsurf/
+.codeium/
 
 ## Publish profiles — these contain deployment credentials, never commit them
 **/Properties/PublishProfiles/*.pubxml

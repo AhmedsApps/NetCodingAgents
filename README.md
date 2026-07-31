@@ -422,6 +422,6 @@ Add the client's origin to `AllowedOrigins` on the server.
 
 ## License
 
-No license has been chosen yet. Without one, default copyright applies and others may not legally
-reuse the code. If you want this to be open source, add a `LICENSE` file — see
-[choosealicense.com](https://choosealicense.com/) for help picking one.
+Released under the [MIT License](LICENSE) — you are free to use, modify and distribute this
+software, including commercially, provided the copyright notice is retained. The software is
+provided as-is, without warranty.
