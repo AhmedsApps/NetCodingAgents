@@ -602,6 +602,24 @@ public class ChatHub : Hub
         await Clients.All.SendAsync("ReceiveWorkflowUpdate");
     }
 
+    // The worker asks whether a long-running agent should keep going. Relayed to whoever is
+    // viewing that session/workflow; the answer comes back via SubmitRetryDecision.
+    public async Task RequestContinueDecision(Guid id, bool isWorkflow, string message)
+    {
+        if (isWorkflow)
+        {
+            var wf = await _dbContext.Workflows.FindAsync(id);
+            if (wf != null)
+            {
+                wf.Status = "AwaitingRetryConfirmation";
+                await _dbContext.SaveChangesAsync();
+                await BroadcastWorkflowStateAsync(wf);
+            }
+        }
+        await Clients.Group(id.ToString()).SendAsync("ContinuePrompt", id, isWorkflow, message);
+        await Clients.All.SendAsync("ReceiveWorkflowUpdate");
+    }
+
     public async Task SubmitRetryDecision(Guid workflowId, bool retry)
     {
         var worker = _workers.GetWorkerConnectionId();
@@ -609,6 +627,8 @@ public class ChatHub : Hub
         {
             await Clients.Client(worker).SendAsync("OnRetryDecision", workflowId, retry);
         }
+        // Dismiss the prompt on every client viewing this session/workflow.
+        await Clients.Group(workflowId.ToString()).SendAsync("ContinuePromptResolved", workflowId);
     }
 
     // Sends an additional instruction on the same workflow; the worker re-engages the team

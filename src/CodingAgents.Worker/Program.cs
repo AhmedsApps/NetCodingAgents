@@ -51,6 +51,12 @@ public class Worker : BackgroundService
     private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _runningWorkflows = new();
     private readonly ConcurrentDictionary<Guid, TaskCompletionSource<bool>> _retryWaiters = new();
 
+    // Identifies which chat session / workflow the current agent run belongs to, so a soft
+    // timeout knows where to send its "keep going?" prompt. AsyncLocal flows down the async
+    // call chain and stays isolated between concurrent runs.
+    private sealed record RunContext(Guid Id, bool IsWorkflow);
+    private static readonly AsyncLocal<RunContext?> _runContext = new();
+
     // Rate limit monitoring fields (copied from original RateLimitService)
     private readonly string _claudeDir;
     private readonly string _logPath;
@@ -258,6 +264,7 @@ public class Worker : BackgroundService
     {
         if (_connection == null) return;
         _logger.LogInformation("[ChatAgent] Received execution request for Session {Id}", sessionId);
+        _runContext.Value = new RunContext(sessionId, false);
 
         try
         {
@@ -535,23 +542,69 @@ Guidelines:
         return "UNEXPECTED (" + ex.GetType().Name + "): " + ex.Message;
     }
 
+    /// <summary>
+    /// Asks the user whether a long-running agent should keep going. The agent is still
+    /// running while we wait, so approving costs nothing. Returns false to stop.
+    /// </summary>
+    private async Task<bool> AskContinueAsync(int minutes, CancellationToken ct)
+    {
+        var ctx = _runContext.Value;
+        if (_connection == null || ctx == null) return false;   // nobody to ask -> stop
+
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _retryWaiters[ctx.Id] = tcs;
+        try
+        {
+            using var reg = ct.Register(() => tcs.TrySetCanceled());
+            var message =
+                $"The agent has been working for {minutes} minutes and hasn't finished yet. " +
+                "It is still running - continue waiting?";
+            _logger.LogInformation("[Timeout] Asking user whether to continue {Id}.", ctx.Id);
+            await _connection.SendAsync("RequestContinueDecision", ctx.Id, ctx.IsWorkflow, message, ct);
+            return await tcs.Task;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        finally
+        {
+            _retryWaiters.TryRemove(ctx.Id, out _);
+        }
+    }
+
     private async Task<string> RunAgentTextAsync(ChatClientAgent agent, string prompt, CancellationToken ct, int? timeoutMinutes = null)
     {
         int minutes = timeoutMinutes ?? _agentTimeoutMinutes;
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromMinutes(minutes));
-        try
+
+        // Soft timeout: start the run and watch a timer alongside it. Reaching the deadline
+        // does NOT cancel the agent - the model call keeps going while we ask the user
+        // whether to keep waiting, so answering "continue" loses no work.
+        var runTask = agent.RunAsync(prompt, cancellationToken: cts.Token);
+
+        while (true)
         {
-            var response = await agent.RunAsync(prompt, cancellationToken: cts.Token);
-            return response.Text ?? "";
-        }
-        // Only our internal timer fired: report a real timeout instead of a bare
-        // "operation was canceled". A cancel on the caller's token is re-thrown as-is.
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            throw new TimeoutException(
-                $"The agent did not finish within {minutes} minutes and was stopped. " +
-                "Try a simpler request, a faster model, or raise 'AgentTimeoutMinutes' in the worker settings.");
+            var timer = Task.Delay(TimeSpan.FromMinutes(minutes), cts.Token);
+            var finished = await Task.WhenAny(runTask, timer);
+
+            if (finished == runTask)
+            {
+                var response = await runTask;   // propagate result or failure
+                return response.Text ?? "";
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            bool keepGoing = await AskContinueAsync(minutes, ct);
+            if (!keepGoing)
+            {
+                cts.Cancel();
+                try { await runTask; } catch { /* expected cancellation */ }
+                throw new TimeoutException(
+                    $"The agent ran past {minutes} minutes and was stopped at your request.");
+            }
+            // Approved: extend by another full interval and keep waiting.
         }
     }
 
@@ -630,6 +683,7 @@ Guidelines:
     {
         if (_connection == null) return;
         _logger.LogInformation("[Workflow] Received execution request for Workflow {Id}", workflowId);
+        _runContext.Value = new RunContext(workflowId, true);
 
         // All agents in this workflow share one isolated working folder so the executor's
         // changes are visible to the reviewers. Honor a user-chosen folder if provided,

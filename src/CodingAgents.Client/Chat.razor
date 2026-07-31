@@ -172,6 +172,16 @@ else
                         </div>
 
                         <div class="input-container">
+                            @if (_continuePromptId == _selectedSessionId && _selectedSessionId != Guid.Empty)
+                            {
+                                <div class="continue-prompt">
+                                    <span>⏳ @_continuePromptMessage</span>
+                                    <div class="continue-actions">
+                                        <button class="continue-yes" @onclick="() => AnswerContinuePrompt(true)">Keep going</button>
+                                        <button class="continue-no" @onclick="() => AnswerContinuePrompt(false)">Stop</button>
+                                    </div>
+                                </div>
+                            }
                             <div class="quick-commands">
                                 @foreach (var cmd in _quickCommands)
                                 {
@@ -329,6 +339,17 @@ else
                                 {
                                     <div class="workflow-workspace-readout" title="Working directory">
                                         📁 <code>@_selectedWorkflow.WorkspacePath</code>
+                                    </div>
+                                }
+
+                                @if (_continuePromptId == _selectedWorkflowId && _selectedWorkflowId != Guid.Empty)
+                                {
+                                    <div class="continue-prompt">
+                                        <span>⏳ @_continuePromptMessage</span>
+                                        <div class="continue-actions">
+                                            <button class="continue-yes" @onclick="() => AnswerContinuePrompt(true)">Keep going</button>
+                                            <button class="continue-no" @onclick="() => AnswerContinuePrompt(false)">Stop</button>
+                                        </div>
                                     </div>
                                 }
 
@@ -728,6 +749,10 @@ else
     // from the client<->server hub connection (_hubConnection.State).
     private bool _workerConnected = false;
 
+    // Set when the worker asks whether a long-running agent should keep going.
+    private Guid _continuePromptId = Guid.Empty;
+    private string _continuePromptMessage = string.Empty;
+
     // Base URL of the server, used to resolve relative artifact/image URLs.
     private string _serverBaseUrl = string.Empty;
 
@@ -870,6 +895,26 @@ else
         };
 
         // Live worker online/offline updates broadcast by the server.
+        _hubConnection.On<Guid, bool, string>("ContinuePrompt", (id, isWorkflow, message) =>
+        {
+            if (id == _selectedSessionId || id == _selectedWorkflowId)
+            {
+                _continuePromptId = id;
+                _continuePromptMessage = message;
+                InvokeAsync(StateHasChanged);
+            }
+        });
+
+        _hubConnection.On<Guid>("ContinuePromptResolved", (id) =>
+        {
+            if (id == _continuePromptId)
+            {
+                _continuePromptId = Guid.Empty;
+                _continuePromptMessage = string.Empty;
+                InvokeAsync(StateHasChanged);
+            }
+        });
+
         _hubConnection.On<bool>("WorkerStatusChanged", (connected) =>
         {
             _workerConnected = connected;
@@ -1340,6 +1385,17 @@ else
         if (_hubConnection == null) return;
         try { await _hubConnection.InvokeAsync("CancelWorkflow", workflowId); }
         catch (Exception ex) { Console.WriteLine($"Error cancelling workflow: {ex.Message}"); }
+    }
+
+    private async Task AnswerContinuePrompt(bool keepGoing)
+    {
+        if (_hubConnection == null || _continuePromptId == Guid.Empty) return;
+        var id = _continuePromptId;
+        _continuePromptId = Guid.Empty;
+        _continuePromptMessage = string.Empty;
+        StateHasChanged();
+        try { await _hubConnection.InvokeAsync("SubmitRetryDecision", id, keepGoing); }
+        catch (Exception ex) { Console.WriteLine($"Error answering continue prompt: {ex.Message}"); }
     }
 
     private async Task SubmitRetryDecision(bool retry)
