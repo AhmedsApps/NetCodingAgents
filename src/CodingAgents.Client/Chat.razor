@@ -318,9 +318,13 @@ else
                                     <h2>Task Details</h2>
                                     @if (_selectedWorkflow.Status == "AwaitingRetryConfirmation")
                                     {
-                                        <span class="workflow-status-badge header-badge awaitingretryconfirmation" style="background: #e2a000; color: #fff; margin-right: 10px;">Awaiting Retry Confirmation</span>
-                                        <button class="btn btn-primary" style="padding: 5px 10px; font-size: 0.85em; margin-right: 5px;" @onclick="() => SubmitRetryDecision(true)">🔄 Yes, Retry</button>
-                                        <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.85em;" @onclick="() => SubmitRetryDecision(false)">🛑 No, Stop</button>
+                                        <span class="workflow-status-badge header-badge awaitingretryconfirmation" style="background: #e2a000; color: #fff; margin-right: 10px;">Reviewers still have comments</span>
+                                        <button class="btn btn-primary" style="padding: 5px 10px; font-size: 0.85em; margin-right: 5px;"
+                                                title="Let the team keep working through the reviewers' comments for 3 more iterations"
+                                                @onclick="() => SubmitRetryDecision(true)">🔄 Retry (3 more)</button>
+                                        <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.85em;"
+                                                title="Finish now and keep the current code, waiving the remaining review comments"
+                                                @onclick="() => SubmitRetryDecision(false)">✅ Accept current version</button>
                                     }
                                     else
                                     {

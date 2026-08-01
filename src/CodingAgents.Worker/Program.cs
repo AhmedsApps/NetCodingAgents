@@ -763,23 +763,40 @@ Output a clean, refined, and highly precise task description designed for an aut
                 if (iteration >= settings.MaxReviewIterations)
                 {
                     await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, currentInstruction, "AwaitingRetryConfirmation", settings.DefaultExecutor);
-                    await _connection.SendAsync("ReportWorkflowLog", workflowId, "System", "Workflow reached maximum iterations. Waiting for user confirmation to retry...");
-                    
-                    var tcs = new TaskCompletionSource<bool>();
+                    await _connection.SendAsync("ReportWorkflowLog", workflowId, "System",
+                        "Reviewers still have comments after the maximum iterations. Waiting for your decision: retry, or accept the current version as-is.");
+
+                    // RunContinuationsAsynchronously is essential. Without it the remainder of
+                    // this pipeline resumes inline on the SignalR dispatch thread when the
+                    // answer arrives, blocking the connection's message pump so its own
+                    // SendAsync calls never complete - the workflow appears to hang.
+                    var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                     _retryWaiters[workflowId] = tcs;
-                    
-                    using var reg = ct.Register(() => tcs.TrySetCanceled());
-                    bool shouldRetry = await tcs.Task;
-                    
-                    _retryWaiters.TryRemove(workflowId, out _);
-                    
+
+                    bool shouldRetry;
+                    try
+                    {
+                        using var reg = ct.Register(() => tcs.TrySetCanceled());
+                        shouldRetry = await tcs.Task;
+                    }
+                    finally
+                    {
+                        _retryWaiters.TryRemove(workflowId, out _);
+                    }
+
                     if (!shouldRetry)
                     {
+                        // Accept the latest version regardless of outstanding review comments.
+                        isApproved = true;
+                        await _connection.SendAsync("ReportWorkflowLog", workflowId, "System",
+                            "User accepted the current version. Remaining review comments were waived.");
                         break;
                     }
-                    
-                    settings.MaxReviewIterations++; // allow one more iteration
-                    await _connection.SendAsync("ReportWorkflowLog", workflowId, "System", "User approved retry. Continuing execution...");
+
+                    // Grant a fresh batch of iterations rather than a single extra pass.
+                    settings.MaxReviewIterations += 3;
+                    await _connection.SendAsync("ReportWorkflowLog", workflowId, "System",
+                        $"User chose to retry. Granting 3 more iterations (up to {settings.MaxReviewIterations}).");
                 }
 
                 ct.ThrowIfCancellationRequested();
