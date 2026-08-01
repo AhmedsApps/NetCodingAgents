@@ -8,7 +8,56 @@ public class ConversationSession
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Title { get; set; } = string.Empty;
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    // Rolling summary of the messages that have aged out of the model's context window,
+    // so earlier parts of a long conversation are not simply forgotten.
+    public string Summary { get; set; } = string.Empty;
+    // Everything at or before this timestamp is represented by Summary.
+    public DateTime? SummarizedThroughUtc { get; set; }
+
     public List<PersistedMessage> Messages { get; set; } = new();
+}
+
+/// <summary>A durable fact the agent has learned, reusable across sessions.</summary>
+public class MemoryFact
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    // "global", or a workspace path, so facts can be scoped to a project.
+    public string Scope { get; set; } = "global";
+    public string Topic { get; set; } = string.Empty;
+    public string Content { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}
+
+/// <summary>Vector embedding of a single message, used for semantic recall.</summary>
+public class MessageEmbedding
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid SessionId { get; set; }
+    public Guid MessageId { get; set; }
+    public string Role { get; set; } = string.Empty;
+    // The embedded text, kept so a hit can be shown without a second lookup.
+    public string Content { get; set; } = string.Empty;
+    // Comma-separated floats. SQL Server has no portable vector type across versions.
+    public string Vector { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public class MemoryFactDto
+{
+    public Guid Id { get; set; }
+    public string Scope { get; set; } = string.Empty;
+    public string Topic { get; set; } = string.Empty;
+    public string Content { get; set; } = string.Empty;
+}
+
+public class MessageEmbeddingDto
+{
+    public Guid MessageId { get; set; }
+    public string Role { get; set; } = string.Empty;
+    public string Content { get; set; } = string.Empty;
+    public string Vector { get; set; } = string.Empty;
 }
 
 public class PersistedMessage

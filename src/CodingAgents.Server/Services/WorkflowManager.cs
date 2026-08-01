@@ -117,9 +117,11 @@ public class WorkflowManager
                 return;
             }
 
+            // Include any plans already produced so a resumed workflow doesn't redo the
+            // analyst and engineer phases from scratch.
             var meta = await db.Workflows
                 .Where(w => w.Id == workflowId)
-                .Select(w => new { w.OriginalTask, w.WorkspacePath })
+                .Select(w => new { w.OriginalTask, w.WorkspacePath, w.AnalystPlan, w.EngineerPlan })
                 .FirstOrDefaultAsync();
 
             // Record ownership before relaying so a disconnect during/after the send is
@@ -127,7 +129,12 @@ public class WorkflowManager
             _workers.AssignWorkflow(workflowId, workerConnectionId);
 
             await LogProgressAsync(workflowId, "System", "Relaying development workflow to local PC worker...");
-            await _hubContext.Clients.Client(workerConnectionId).SendAsync("ExecuteWorkflow", workflowId, meta?.OriginalTask ?? string.Empty, meta?.WorkspacePath ?? string.Empty);
+            await _hubContext.Clients.Client(workerConnectionId).SendAsync("ExecuteWorkflow",
+                workflowId,
+                meta?.OriginalTask ?? string.Empty,
+                meta?.WorkspacePath ?? string.Empty,
+                meta?.AnalystPlan ?? string.Empty,
+                meta?.EngineerPlan ?? string.Empty);
         }
         catch (Exception ex)
         {

@@ -123,6 +123,39 @@ try
                     ALTER TABLE Settings ADD ChatModel nvarchar(max) NOT NULL DEFAULT 'Ollama:llama3.2:latest';
                 END
 
+                IF COL_LENGTH('Sessions', 'Summary') IS NULL
+                BEGIN
+                    ALTER TABLE Sessions ADD Summary nvarchar(max) NOT NULL DEFAULT '';
+                    ALTER TABLE Sessions ADD SummarizedThroughUtc datetime2 NULL;
+                END
+
+                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MemoryFacts' and xtype='U')
+                BEGIN
+                    CREATE TABLE MemoryFacts (
+                        Id uniqueidentifier NOT NULL PRIMARY KEY,
+                        Scope nvarchar(450) NOT NULL,
+                        Topic nvarchar(450) NOT NULL,
+                        Content nvarchar(max) NOT NULL,
+                        CreatedAt datetime2 NOT NULL,
+                        UpdatedAt datetime2 NOT NULL
+                    );
+                    CREATE INDEX IX_MemoryFacts_Scope ON MemoryFacts (Scope);
+                END
+
+                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MessageEmbeddings' and xtype='U')
+                BEGIN
+                    CREATE TABLE MessageEmbeddings (
+                        Id uniqueidentifier NOT NULL PRIMARY KEY,
+                        SessionId uniqueidentifier NOT NULL,
+                        MessageId uniqueidentifier NOT NULL,
+                        Role nvarchar(50) NOT NULL,
+                        Content nvarchar(max) NOT NULL,
+                        Vector nvarchar(max) NOT NULL,
+                        CreatedAt datetime2 NOT NULL
+                    );
+                    CREATE INDEX IX_MessageEmbeddings_SessionId ON MessageEmbeddings (SessionId);
+                END
+
                 IF COL_LENGTH('Workflows', 'WorkspacePath') IS NULL
                 BEGIN
                     ALTER TABLE Workflows ADD WorkspacePath nvarchar(max) NOT NULL DEFAULT '';

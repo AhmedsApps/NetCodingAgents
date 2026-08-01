@@ -16,6 +16,8 @@ public class ChatDbContext : DbContext
     public DbSet<SystemSettings> Settings => Set<SystemSettings>();
     public DbSet<ModelConfiguration> ModelConfigurations => Set<ModelConfiguration>();
     public DbSet<AppCredential> AppCredentials => Set<AppCredential>();
+    public DbSet<MemoryFact> MemoryFacts => Set<MemoryFact>();
+    public DbSet<MessageEmbedding> MessageEmbeddings => Set<MessageEmbedding>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

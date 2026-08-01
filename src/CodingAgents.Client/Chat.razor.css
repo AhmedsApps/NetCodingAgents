@@ -1501,3 +1501,28 @@
 .continue-yes:hover { background-color: #ffb914; }
 .continue-no { background-color: transparent; border-color: #8b92a5; color: #c3c9d5; }
 .continue-no:hover { border-color: #ff5470; color: #ff5470; }
+
+/* Live character count for the message box */
+.char-counter {
+    text-align: right;
+    font-size: 0.75rem;
+    color: #6b7280;
+    margin-top: 6px;
+    padding-right: 4px;
+    transition: color 0.2s;
+}
+
+.char-counter.near-limit { color: #e2a000; }
+.char-counter.at-limit { color: #ff5470; font-weight: 500; }
+
+/* Hint shown when no model endpoints are configured yet */
+.executor-hint {
+    margin-top: 10px;
+    padding: 12px 14px;
+    background-color: #2a2410;
+    border: 1px solid #e2a000;
+    border-radius: 8px;
+    color: #f0d089;
+    font-size: 0.85rem;
+    line-height: 1.5;
+}

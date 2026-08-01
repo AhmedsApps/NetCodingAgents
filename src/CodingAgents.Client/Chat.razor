@@ -200,6 +200,7 @@ else
                                 </label>
                                 <textarea class="chat-input"
                                           placeholder="Ask the developer agent to write code, build, or run tests..."
+                                          maxlength="@MaxInputChars"
                                           @bind="_userInput"
                                           @bind:event="oninput"
                                           @onkeydown="HandleKeyDown"
@@ -209,6 +210,13 @@ else
                                         disabled="@(string.IsNullOrWhiteSpace(_userInput) || _isAgentRunning || _hubConnection?.State != HubConnectionState.Connected)">
                                     ➔
                                 </button>
+                            </div>
+                            <div class="char-counter @(_userInput.Length >= MaxInputChars ? "at-limit" : _userInput.Length > MaxInputChars * 0.9 ? "near-limit" : "")">
+                                @_userInput.Length.ToString("N0") / @MaxInputChars.ToString("N0")
+                                @if (_userInput.Length >= MaxInputChars)
+                                {
+                                    <span> — character limit reached</span>
+                                }
                             </div>
                         </div>
                     }
@@ -255,6 +263,7 @@ else
                         <div class="workflow-submit-box">
                             <textarea class="workflow-input"
                                       placeholder="Describe a development task..."
+                                      maxlength="@MaxInputChars"
                                       @bind="_workflowInput"
                                       disabled="@(_hubConnection?.State != HubConnectionState.Connected)"></textarea>
                             <input class="workflow-workspace-input"
@@ -435,6 +444,7 @@ else
                                 <div class="workflow-followup-box">
                                     <textarea class="workflow-input"
                                               placeholder="Send a follow-up on this task (re-engages the team in the same folder)..."
+                                              maxlength="@MaxInputChars"
                                               @bind="_followUpInput"
                                               disabled="@(_hubConnection?.State != HubConnectionState.Connected)"></textarea>
                                     <button class="new-chat-btn submit-workflow-btn"
@@ -495,15 +505,28 @@ else
                         <div class="settings-form">
                             <!-- Tool Executor selection -->
                             <div class="form-group">
-                                <label class="form-label">Default Code Executor Tool</label>
-                                <span class="form-help">Select the tool used to execute Software Engineer tasks in the workspace.</span>
+                                <label class="form-label">Default Code Executor</label>
+                                <span class="form-help">
+                                    Who carries out the work. The <strong>built-in agent</strong> runs entirely inside this
+                                    app using the model you choose &mdash; no external tools required. Claude Code CLI hands
+                                    the task to Anthropic's separate command-line tool, which must be installed locally.
+                                </span>
                                 <select class="model-dropdown-select" @bind="UnifiedExecutorSelection">
-                                    <option value="ClaudeCode">Claude Code CLI (Anthropic Natively)</option>
                                     @foreach (var config in _modelConfigs)
                                     {
-                                        <option value="Antigravity:@config.Name">Antigravity Engine + @config.Name (@config.Provider)</option>
+                                        <option value="Antigravity:@config.Name">Built-in agent + @config.Name (@config.Provider)</option>
                                     }
+                                    <option value="ClaudeCode">Claude Code CLI (external tool)</option>
                                 </select>
+                                @if (_modelConfigs.Count == 0)
+                                {
+                                    <div class="executor-hint">
+                                        ⚠️ No models configured yet, so only the external Claude Code option is listed.
+                                        Add an endpoint under <strong>Model Configurations</strong> below (e.g. an Ollama
+                                        model) and the built-in agent will appear here &mdash; that is the option that runs
+                                        without any external tool.
+                                    </div>
+                                }
                             </div>
 
                             <!-- Direct Chat Agent Model -->
@@ -783,6 +806,10 @@ else
     private List<PersistedMessage>? _messages;
     private List<AgentProgressDto> _progressLogs = new();
     private Guid _selectedSessionId = Guid.Empty;
+    // Longest message a user may type. Matches the worker's per-message context budget, so
+    // nothing typed here can be silently truncated later.
+    private const int MaxInputChars = 8000;
+
     private string _userInput = string.Empty;
     private bool _isAgentRunning = false;
     private bool _showLogs = true;

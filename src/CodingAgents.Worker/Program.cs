@@ -45,6 +45,12 @@ public class Worker : BackgroundService
     // Wall-clock cap for a single agent run. Long tasks on slow local models can exceed
     // the default, so it is configurable via "AgentTimeoutMinutes".
     private readonly int _agentTimeoutMinutes;
+    // Character budget for the message list sent to a model on each call. Roughly 4 chars
+    // per token, so the default is about 12k tokens. Configurable via "MaxContextChars".
+    private readonly int _maxContextChars;
+    // Ollama model used to embed messages for semantic recall. Set to "" to disable recall.
+    private readonly string _embeddingModel;
+    private readonly string _ollamaUrl;
 
     // Cancellation sources for workflows currently running, keyed by workflow id, so a
     // user-requested Stop can cancel the specific in-flight pipeline.
@@ -73,6 +79,9 @@ public class Worker : BackgroundService
         // Must match the server's "WorkerKey" setting.
         _workerKey = configuration["WorkerKey"] ?? "change-me-worker-key";
         _agentTimeoutMinutes = int.TryParse(configuration["AgentTimeoutMinutes"], out var atm) && atm > 0 ? atm : 20;
+        _maxContextChars = int.TryParse(configuration["MaxContextChars"], out var mcc) && mcc > 4000 ? mcc : 48000;
+        _embeddingModel = configuration["EmbeddingModel"] ?? "nomic-embed-text";
+        _ollamaUrl = configuration["OllamaUrl"] ?? "http://localhost:11434/";
 
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         // Root under which each chat session / workflow gets its own isolated working folder.
@@ -111,14 +120,16 @@ public class Worker : BackgroundService
             _ = Task.Run(() => RunChatAgentAsync(sessionId, content, stoppingToken), stoppingToken);
         });
 
-        _connection.On<Guid, string, string>("ExecuteWorkflow", (workflowId, originalTask, workspacePath) =>
+        _connection.On<Guid, string, string, string, string>("ExecuteWorkflow",
+            (workflowId, originalTask, workspacePath, analystPlan, engineerPlan) =>
         {
-            StartWorkflowRun(workflowId, originalTask, workspacePath, stoppingToken);
+            StartWorkflowRun(workflowId, originalTask, workspacePath, analystPlan, engineerPlan, stoppingToken);
         });
 
         _connection.On<Guid, string, string>("ExecuteWorkflowFollowUp", (workflowId, message, workspacePath) =>
         {
-            StartWorkflowRun(workflowId, message, workspacePath, stoppingToken);
+            // A follow-up is a new instruction, so the team re-plans from scratch.
+            StartWorkflowRun(workflowId, message, workspacePath, string.Empty, string.Empty, stoppingToken);
         });
 
         _connection.On<Guid>("CancelWorkflow", (workflowId) =>
@@ -301,7 +312,7 @@ public class Worker : BackgroundService
                 }
             };
 
-            var instructions = @"You are a local developer agent. You have direct access to the user's project workspace using tools.
+            string instructions = @"You are a local developer agent. You have direct access to the user's project workspace using tools.
 You are communicating with the user remotely via this chat interface. You can receive instructions from the user, inspect their codebase, edit files, and run build or test commands.
 
 Available tools:
@@ -327,6 +338,47 @@ Guidelines:
             var chatTools = FullDevTools(tools);
             chatTools.Add(AIFunctionFactory.Create(tools.TakeScreenshot));
             chatTools.Add(AIFunctionFactory.Create(tools.AttachImage));
+
+            // Durable memory the agent controls itself, shared across sessions.
+            chatTools.Add(AIFunctionFactory.Create(
+                async (string topic, string content) =>
+                {
+                    try
+                    {
+                        await _connection.SendAsync("SaveMemoryFact", workspaceDir, topic, content);
+                        return $"Remembered '{topic}'.";
+                    }
+                    catch (Exception ex) { return "Could not save that: " + ex.Message; }
+                },
+                "RememberFact",
+                "Store a durable fact about this project (conventions, architecture, decisions, preferences) that should be remembered in future conversations. Saving the same topic again replaces it."));
+
+            chatTools.Add(AIFunctionFactory.Create(
+                async () =>
+                {
+                    try
+                    {
+                        var facts = await _connection.InvokeAsync<List<MemoryFactDto>>("GetMemoryFacts", workspaceDir);
+                        return facts.Count == 0
+                            ? "No facts stored yet."
+                            : string.Join("\n", facts.Select(f => $"- {f.Topic}: {f.Content}"));
+                    }
+                    catch (Exception ex) { return "Could not read memory: " + ex.Message; }
+                },
+                "RecallFacts",
+                "List durable facts previously stored about this project."));
+            // Seed the agent with what it already knows about this project.
+            try
+            {
+                var facts = await _connection.InvokeAsync<List<MemoryFactDto>>("GetMemoryFacts", workspaceDir, ct);
+                if (facts.Count > 0)
+                {
+                    instructions += "\n\nWhat you already know about this project (from earlier sessions):\n"
+                        + string.Join("\n", facts.Take(40).Select(f => $"- {f.Topic}: {f.Content}"));
+                }
+            }
+            catch (Exception ex) { _logger.LogDebug("Could not load memory facts: {Message}", ex.Message); }
+
             var agent = CreateAgent(chatClient, instructions, "WorkspaceAgent", chatTools);
 
             await _connection.SendAsync("ReportWorkerProgress", sessionId, "Status", "Agent executing local query...");
@@ -340,8 +392,45 @@ Guidelines:
                 var convo = history.Where(m => m.Role is "User" or "Assistant").ToList();
                 if (convo.Count > 1)
                 {
-                    var prior = string.Join("\n\n", convo.Take(convo.Count - 1).Select(m => $"{m.Role}: {m.Content}"));
-                    prompt = $"Conversation so far:\n{prior}\n\nCurrent user message:\n{content}";
+                    // Include only the most recent turns that fit a share of the context
+                    // budget. Without this the whole session history is replayed on every
+                    // message and eventually overflows the model's window.
+                    var prior = convo.Take(convo.Count - 1).ToList();
+                    int budget = _maxContextChars / 2;
+                    var selected = new List<PersistedMessage>();
+                    for (int i = prior.Count - 1; i >= 0; i--)
+                    {
+                        int len = (prior[i].Content?.Length ?? 0) + prior[i].Role.Length + 4;
+                        if (selected.Count > 0 && budget - len < 0) break;
+                        budget -= len;
+                        selected.Insert(0, prior[i]);
+                    }
+
+                    int omitted = prior.Count - selected.Count;
+                    var joined = string.Join("\n\n", selected.Select(m => $"{m.Role}: {m.Content}"));
+
+                    // Long-term memory: a rolling summary of what fell out of the window,
+                    // plus any older messages semantically related to this request.
+                    var sections = new List<string>();
+
+                    var summary = await _connection.InvokeAsync<string>("GetSessionSummary", sessionId, ct);
+                    if (!string.IsNullOrWhiteSpace(summary))
+                        sections.Add($"Summary of earlier conversation:\n{summary}");
+
+                    var recalled = await RecallRelevantAsync(sessionId, content, 4, ct);
+                    if (!string.IsNullOrWhiteSpace(recalled))
+                        sections.Add(recalled);
+
+                    sections.Add($"Recent conversation:\n{joined}");
+                    sections.Add($"Current user message:\n{content}");
+                    prompt = string.Join("\n\n", sections);
+
+                    // Fold anything newly dropped into the rolling summary so it is not lost.
+                    if (omitted > 0)
+                    {
+                        var dropped = prior.Take(omitted).ToList();
+                        await UpdateSessionSummaryAsync(sessionId, dropped, summary, chatClient, ct);
+                    }
                 }
             }
             catch (Exception ex)
@@ -354,6 +443,10 @@ Guidelines:
 
             _logger.LogInformation("[ChatAgent] Execution completed successfully.");
             await _connection.SendAsync("ReportWorkerResponse", sessionId, assistantContent);
+
+            // Index this exchange so it can be recalled semantically in future turns.
+            await RememberMessageAsync(sessionId, "User", content, ct);
+            await RememberMessageAsync(sessionId, "Assistant", assistantContent, ct);
         }
         catch (OperationCanceledException)
         {
@@ -472,8 +565,13 @@ Guidelines:
         return list;
     }
 
-    private static ChatClientAgent CreateAgent(IChatClient client, string instructions, string name, List<AITool>? tools)
+    private ChatClientAgent CreateAgent(IChatClient client, string instructions, string name, List<AITool>? tools)
     {
+        // Keep every request inside the context budget. This wraps the innermost client so
+        // it also covers the agent's internal tool-calling loop, which is where large tool
+        // outputs accumulate over a long run.
+        client = new ContextTrimmingChatClient(client, _maxContextChars);
+
         if (tools is { Count: > 0 })
         {
             // Wrap so weak local models that emit tool calls as raw JSON text still work.
@@ -573,6 +671,135 @@ Guidelines:
         }
     }
 
+    // ---- Long-term memory ----------------------------------------------------------
+
+    /// <summary>
+    /// Embeds text with Ollama. Returns null when embeddings are disabled or unavailable,
+    /// in which case the caller simply skips semantic recall.
+    /// </summary>
+    private async Task<float[]?> EmbedAsync(string text, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(_embeddingModel) || string.IsNullOrWhiteSpace(text)) return null;
+        try
+        {
+            using var http = new HttpClient { BaseAddress = new Uri(_ollamaUrl), Timeout = TimeSpan.FromSeconds(60) };
+            var payload = new { model = _embeddingModel, prompt = text.Length > 8000 ? text.Substring(0, 8000) : text };
+            using var resp = await http.PostAsJsonAsync("api/embeddings", payload, ct);
+            if (!resp.IsSuccessStatusCode) return null;
+            var json = JsonNode.Parse(await resp.Content.ReadAsStringAsync(ct));
+            if (json?["embedding"] is not JsonArray arr || arr.Count == 0) return null;
+            var vec = new float[arr.Count];
+            for (int i = 0; i < arr.Count; i++) vec[i] = (float)(arr[i]?.GetValue<double>() ?? 0);
+            return vec;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Embedding unavailable: {Message}", ex.Message);
+            return null;
+        }
+    }
+
+    private static float[] ParseVector(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return Array.Empty<float>();
+        var parts = s.Split(',', StringSplitOptions.RemoveEmptyEntries);
+        var v = new float[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+            float.TryParse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out v[i]);
+        return v;
+    }
+
+    private static string FormatVector(float[] v) =>
+        string.Join(",", v.Select(f => f.ToString("R", CultureInfo.InvariantCulture)));
+
+    private static double Cosine(float[] a, float[] b)
+    {
+        if (a.Length == 0 || a.Length != b.Length) return 0;
+        double dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < a.Length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+        return (na == 0 || nb == 0) ? 0 : dot / (Math.Sqrt(na) * Math.Sqrt(nb));
+    }
+
+    /// <summary>Finds older messages semantically related to the current one.</summary>
+    private async Task<string> RecallRelevantAsync(Guid sessionId, string query, int topK, CancellationToken ct)
+    {
+        if (_connection == null) return string.Empty;
+        var queryVec = await EmbedAsync(query, ct);
+        if (queryVec == null) return string.Empty;
+
+        try
+        {
+            var stored = await _connection.InvokeAsync<List<MessageEmbeddingDto>>("GetMessageEmbeddings", sessionId, ct);
+            if (stored.Count == 0) return string.Empty;
+
+            var ranked = stored
+                .Select(e => (e, score: Cosine(queryVec, ParseVector(e.Vector))))
+                .Where(x => x.score > 0.5)                 // ignore weak matches
+                .OrderByDescending(x => x.score)
+                .Take(topK)
+                .ToList();
+
+            if (ranked.Count == 0) return string.Empty;
+            var lines = ranked.Select(x => $"- ({x.e.Role}) {Shorten(x.e.Content, 500)}");
+            return "Possibly relevant earlier messages:\n" + string.Join("\n", lines);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Semantic recall skipped: {Message}", ex.Message);
+            return string.Empty;
+        }
+    }
+
+    private static string Shorten(string text, int max) =>
+        string.IsNullOrEmpty(text) || text.Length <= max ? text ?? "" : text.Substring(0, max) + "...";
+
+    /// <summary>Stores the embedding of a message so it can be recalled later.</summary>
+    private async Task RememberMessageAsync(Guid sessionId, string role, string content, CancellationToken ct)
+    {
+        if (_connection == null || string.IsNullOrWhiteSpace(content)) return;
+        var vec = await EmbedAsync(content, ct);
+        if (vec == null) return;
+        try
+        {
+            await _connection.SendAsync("SaveMessageEmbedding", sessionId, Guid.NewGuid(), role,
+                Shorten(content, 4000), FormatVector(vec), ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Could not store embedding: {Message}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Condenses the part of a conversation that has aged out of the context window into a
+    /// rolling summary, so older detail is retained instead of simply dropping off.
+    /// </summary>
+    private async Task UpdateSessionSummaryAsync(Guid sessionId, List<PersistedMessage> dropped,
+                                                 string previousSummary, IChatClient client, CancellationToken ct)
+    {
+        if (_connection == null || dropped.Count == 0) return;
+        try
+        {
+            var transcript = string.Join("\n", dropped.Select(m => $"{m.Role}: {Shorten(m.Content, 1000)}"));
+            var instructions = "You maintain a running summary of a developer conversation. " +
+                "Merge the previous summary with the new messages into a single concise summary. " +
+                "Keep decisions, file names, and unresolved issues. Output only the summary.";
+            var agent = CreateAgent(client, instructions, "Summarizer", null);
+            var prompt = $"Previous summary:\n{(string.IsNullOrWhiteSpace(previousSummary) ? "(none)" : previousSummary)}\n\nNew messages:\n{transcript}";
+            var summary = await RunAgentTextAsync(agent, prompt, ct, timeoutMinutes: 5);
+            if (!string.IsNullOrWhiteSpace(summary))
+            {
+                await _connection.SendAsync("SaveSessionSummary", sessionId, Shorten(summary, 6000),
+                    dropped.Last().Timestamp, ct);
+                _logger.LogInformation("[Memory] Session summary updated ({Count} messages folded in).", dropped.Count);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Summary update skipped: {Message}", ex.Message);
+        }
+    }
+
     private async Task<string> RunAgentTextAsync(ChatClientAgent agent, string prompt, CancellationToken ct, int? timeoutMinutes = null)
     {
         int minutes = timeoutMinutes ?? _agentTimeoutMinutes;
@@ -651,7 +878,8 @@ Guidelines:
 
     // Wraps a workflow run in its own cancellation source (linked to shutdown) so a user
     // Stop request can cancel this specific pipeline, and cleans it up when finished.
-    private void StartWorkflowRun(Guid workflowId, string task, string workspacePath, CancellationToken stoppingToken)
+    private void StartWorkflowRun(Guid workflowId, string task, string workspacePath,
+                                 string existingAnalystPlan, string existingEngineerPlan, CancellationToken stoppingToken)
     {
         // Cancel any prior in-flight run for the same workflow so a follow-up or re-dispatch
         // doesn't spawn a duplicate concurrent pipeline.
@@ -666,7 +894,7 @@ Guidelines:
         {
             try
             {
-                await RunWorkflowPipelineAsync(workflowId, task, workspacePath, cts.Token);
+                await RunWorkflowPipelineAsync(workflowId, task, workspacePath, existingAnalystPlan, existingEngineerPlan, cts.Token);
             }
             finally
             {
@@ -679,7 +907,8 @@ Guidelines:
         }, stoppingToken);
     }
 
-    private async Task RunWorkflowPipelineAsync(Guid workflowId, string originalTask, string workspacePath, CancellationToken ct)
+    private async Task RunWorkflowPipelineAsync(Guid workflowId, string originalTask, string workspacePath,
+                                               string existingAnalystPlan, string existingEngineerPlan, CancellationToken ct)
     {
         if (_connection == null) return;
         _logger.LogInformation("[Workflow] Received execution request for Workflow {Id}", workflowId);
@@ -722,6 +951,17 @@ Guidelines:
             var modelConfigs = await _connection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations", ct);
 
             // 1. Analyst Phase — now able to actually inspect the codebase.
+            // A resumed workflow reuses the plan already stored in the database instead of
+            // paying for the whole analysis again.
+            string analystPlan;
+            if (!string.IsNullOrWhiteSpace(existingAnalystPlan) && existingAnalystPlan != "No design plan generated.")
+            {
+                analystPlan = existingAnalystPlan;
+                await _connection.SendAsync("ReportWorkflowLog", workflowId, "Analyst",
+                    "Resuming: reusing the System Analyst's existing plan.");
+            }
+            else
+            {
             await _connection.SendAsync("ReportWorkflowLog", workflowId, "Analyst", "System Analyst: Starting request analysis and design planning...");
 
             var analystInstructions = @"You are a System Analyst and Software Designer. Your job is to take a user's development request, analyze the ACTUAL project structure using your tools, design a complete implementation plan, and write a detailed, step-by-step technical instruction prompt for a software engineer to execute.
@@ -731,13 +971,24 @@ Be highly precise, list the directories/files that need modifications, and expla
             var analystTools = MakeTools("Analyst");
             var analystClient = await CreateChatClientAsync(settings.AnalystModel, modelConfigs);
             var analystAgent = CreateAgent(analystClient, analystInstructions, "SystemAnalyst", ReadOnlyTools(analystTools));
-            string analystPlan = await RunAgentTextAsync(analystAgent, originalTask, ct);
+            analystPlan = await RunAgentTextAsync(analystAgent, originalTask, ct);
             if (string.IsNullOrEmpty(analystPlan)) analystPlan = "No design plan generated.";
 
             await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, null, "Executing", null);
             await _connection.SendAsync("ReportWorkflowLog", workflowId, "Analyst", $"System Analyst Completed Plan:\n{analystPlan}");
+            }
 
             // 2. Engineer Review Phase — can verify the plan against real code.
+            string engineerPlan;
+            var engineerClientShared = await CreateChatClientAsync(settings.EngineerModel, modelConfigs);
+            if (!string.IsNullOrWhiteSpace(existingEngineerPlan) && existingEngineerPlan != "No optimized prompt generated.")
+            {
+                engineerPlan = existingEngineerPlan;
+                await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer",
+                    "Resuming: reusing the Software Engineer's existing optimized prompt.");
+            }
+            else
+            {
             await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer", "Software Engineer: Reviewing analyst plan and optimizing prompt for best practices...");
 
             var engineerInstructions = @"You are a Senior Software Engineer. Your job is to review a System Analyst's implementation plan and instruction prompt.
@@ -745,13 +996,13 @@ Use ListFiles, SearchInFiles, and ReadFile to verify the plan against the real c
 Optimize the prompt to ensure industry-standard best practices in security, performance, naming conventions, and code safety.
 Output a clean, refined, and highly precise task description designed for an automated CLI agent (like Claude Code or Antigravity) to execute directly in the workspace.";
 
-            var engineerClient = await CreateChatClientAsync(settings.EngineerModel, modelConfigs);
-            var engineerAgent = CreateAgent(engineerClient, engineerInstructions, "SoftwareEngineer", ReadOnlyTools(MakeTools("Engineer")));
-            string engineerPlan = await RunAgentTextAsync(engineerAgent, $"Analyst Plan:\n{analystPlan}", ct);
+            var engineerAgent = CreateAgent(engineerClientShared, engineerInstructions, "SoftwareEngineer", ReadOnlyTools(MakeTools("Engineer")));
+            engineerPlan = await RunAgentTextAsync(engineerAgent, $"Analyst Plan:\n{analystPlan}", ct);
             if (string.IsNullOrEmpty(engineerPlan)) engineerPlan = "No optimized prompt generated.";
 
             await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, engineerPlan, "Executing", null);
             await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer", $"Software Engineer Completed Optimized Prompt:\n{engineerPlan}");
+            }
 
             // Loop State Initialization
             int iteration = 0;
@@ -870,7 +1121,7 @@ Use ListFiles, ReadFile, and SearchInFiles to confirm whether the reported issue
 If their concerns are valid, output [VALID] followed by a concrete, step-by-step instruction script for the Executor to apply the fixes.
 If their concerns are false, invalid, or impossible, output [REFUSED] followed by a detailed explanation of why you refuse to fix it.";
 
-                var validationAgent = CreateAgent(engineerClient, validationInstructions, "SoftwareEngineer", ReadOnlyTools(MakeTools("Engineer")));
+                var validationAgent = CreateAgent(engineerClientShared, validationInstructions, "SoftwareEngineer", ReadOnlyTools(MakeTools("Engineer")));
                 string validationText = await RunAgentTextAsync(validationAgent, $"Issues reported by reviewers:\n.NET Reviewer:\n{dnText}\n\nArchitect:\n{archText}", ct);
 
                 await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer", $"Validation Result:\n{validationText}");
@@ -898,7 +1149,7 @@ If their concerns are false, invalid, or impossible, output [REFUSED] followed b
                     else
                     {
                         await _connection.SendAsync("ReportWorkflowLog", workflowId, "System", "Reviewers rejected the refusal. Forcing the Engineer to generate fix instructions...");
-                        var forcedAgent = CreateAgent(engineerClient, "Output only a step-by-step instruction script to fix the original issues.", "SoftwareEngineer", null);
+                        var forcedAgent = CreateAgent(engineerClientShared, "Output only a step-by-step instruction script to fix the original issues.", "SoftwareEngineer", null);
                         string forcedText = await RunAgentTextAsync(forcedAgent, $"Issues:\n{dnText}\n{archText}", ct);
                         currentInstruction = string.IsNullOrEmpty(forcedText) ? "Fix the issues." : forcedText;
                     }
@@ -1069,6 +1320,122 @@ Use SearchInFiles and ReadFile to understand the code, EditFile for small change
         }
     }
 
+}
+
+/// <summary>
+/// Keeps the message list sent to a model inside a character budget so long agent runs do
+/// not overflow the context window. Oversized individual messages (large file reads, build
+/// logs) are truncated first; if the conversation is still too big, the middle is dropped
+/// while the system prompt, the original task and the most recent exchanges are kept.
+/// </summary>
+/// <remarks>
+/// Truncation mutates the message contents in place, so a shrunk history stays shrunk for
+/// the rest of the run instead of being re-trimmed on every call.
+/// </remarks>
+public sealed class ContextTrimmingChatClient : DelegatingChatClient
+{
+    private readonly int _maxTotalChars;
+    private readonly int _maxMessageChars;
+    private readonly int _keepRecent;
+
+    public ContextTrimmingChatClient(IChatClient innerClient, int maxTotalChars = 48000,
+                                     int maxMessageChars = 8000, int keepRecent = 8)
+        : base(innerClient)
+    {
+        _maxTotalChars = maxTotalChars;
+        _maxMessageChars = maxMessageChars;
+        _keepRecent = keepRecent;
+    }
+
+    public override Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        => base.GetResponseAsync(Trim(messages), options, cancellationToken);
+
+    public override IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        => base.GetStreamingResponseAsync(Trim(messages), options, cancellationToken);
+
+    private static int Size(ChatMessage m)
+    {
+        int n = 0;
+        foreach (var c in m.Contents)
+        {
+            switch (c)
+            {
+                case TextContent t: n += t.Text?.Length ?? 0; break;
+                case FunctionCallContent f: n += 64 + (f.Name?.Length ?? 0); break;
+                case FunctionResultContent r: n += (r.Result as string)?.Length ?? 64; break;
+                default: n += 32; break;
+            }
+        }
+        return n;
+    }
+
+    // Only free text and tool output are shortened. Function-call arguments are never
+    // touched, because cutting them would corrupt their JSON.
+    private static void TruncateMessage(ChatMessage m, int max)
+    {
+        for (int i = 0; i < m.Contents.Count; i++)
+        {
+            if (m.Contents[i] is TextContent t && t.Text is { } s && s.Length > max)
+            {
+                m.Contents[i] = new TextContent(s.Substring(0, max) +
+                    $"\n... [{s.Length - max} characters trimmed to fit the context window] ...");
+            }
+            else if (m.Contents[i] is FunctionResultContent r && r.Result is string rs && rs.Length > max)
+            {
+                r.Result = rs.Substring(0, max) +
+                    $"\n... [{rs.Length - max} characters trimmed to fit the context window] ...";
+            }
+        }
+    }
+
+    private List<ChatMessage> Trim(IEnumerable<ChatMessage> source)
+    {
+        var messages = source.ToList();
+
+        foreach (var m in messages) TruncateMessage(m, _maxMessageChars);
+        if (messages.Sum(Size) <= _maxTotalChars) return messages;
+
+        var systems = messages.Where(m => m.Role == ChatRole.System).ToList();
+        var rest = messages.Where(m => m.Role != ChatRole.System).ToList();
+
+        int keep = Math.Min(_keepRecent, rest.Count);
+        var tail = rest.Skip(rest.Count - keep).ToList();
+
+        // Preserve the original task, which is usually the first user message.
+        var head = new List<ChatMessage>();
+        var firstUser = rest.FirstOrDefault(m => m.Role == ChatRole.User);
+        if (firstUser != null && !tail.Contains(firstUser)) head.Add(firstUser);
+
+        int dropped = rest.Count - tail.Count - head.Count;
+
+        var result = new List<ChatMessage>();
+        result.AddRange(systems);
+        result.AddRange(head);
+        if (dropped > 0)
+        {
+            result.Add(new ChatMessage(ChatRole.User,
+                $"[Context trimmed: {dropped} earlier messages were omitted to stay within the model's limit. " +
+                "The original task and the most recent exchanges are preserved.]"));
+        }
+        result.AddRange(tail);
+
+        // A tool result whose originating call was dropped is invalid to most providers,
+        // so remove any orphans (and messages left empty as a result).
+        var callIds = new HashSet<string>(
+            result.SelectMany(m => m.Contents).OfType<FunctionCallContent>().Select(f => f.CallId));
+        foreach (var m in result)
+        {
+            for (int i = m.Contents.Count - 1; i >= 0; i--)
+            {
+                if (m.Contents[i] is FunctionResultContent fr && !callIds.Contains(fr.CallId))
+                    m.Contents.RemoveAt(i);
+            }
+        }
+        result.RemoveAll(m => m.Contents.Count == 0);
+        return result;
+    }
 }
 
 public class OllamaToolParsingChatClient : DelegatingChatClient

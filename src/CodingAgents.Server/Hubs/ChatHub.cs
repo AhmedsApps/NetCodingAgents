@@ -684,6 +684,105 @@ public class ChatHub : Hub
         });
     }
 
+    // ---- Agent memory -------------------------------------------------------------
+
+    /// <summary>Rolling summary of the part of a conversation that has aged out of context.</summary>
+    public async Task<string> GetSessionSummary(Guid sessionId)
+    {
+        var session = await _dbContext.Sessions.FindAsync(sessionId);
+        return session?.Summary ?? string.Empty;
+    }
+
+    public async Task SaveSessionSummary(Guid sessionId, string summary, DateTime summarizedThroughUtc)
+    {
+        var session = await _dbContext.Sessions.FindAsync(sessionId);
+        if (session == null) return;
+        session.Summary = summary ?? string.Empty;
+        session.SummarizedThroughUtc = summarizedThroughUtc;
+        await _dbContext.SaveChangesAsync();
+    }
+
+    /// <summary>Durable facts the agent has learned, optionally scoped to one workspace.</summary>
+    public async Task<List<MemoryFactDto>> GetMemoryFacts(string scope)
+    {
+        var normalized = string.IsNullOrWhiteSpace(scope) ? "global" : scope;
+        return await _dbContext.MemoryFacts
+            .Where(f => f.Scope == "global" || f.Scope == normalized)
+            .OrderByDescending(f => f.UpdatedAt)
+            .Select(f => new MemoryFactDto { Id = f.Id, Scope = f.Scope, Topic = f.Topic, Content = f.Content })
+            .ToListAsync();
+    }
+
+    /// <summary>Adds a fact, or replaces the existing one with the same scope and topic.</summary>
+    public async Task SaveMemoryFact(string scope, string topic, string content)
+    {
+        var normalized = string.IsNullOrWhiteSpace(scope) ? "global" : scope;
+        var existing = await _dbContext.MemoryFacts
+            .FirstOrDefaultAsync(f => f.Scope == normalized && f.Topic == topic);
+
+        if (existing != null)
+        {
+            existing.Content = content;
+            existing.UpdatedAt = DateTime.UtcNow;
+        }
+        else
+        {
+            _dbContext.MemoryFacts.Add(new MemoryFact
+            {
+                Scope = normalized,
+                Topic = topic,
+                Content = content
+            });
+        }
+        await _dbContext.SaveChangesAsync();
+    }
+
+    public async Task DeleteMemoryFact(Guid id)
+    {
+        var fact = await _dbContext.MemoryFacts.FindAsync(id);
+        if (fact != null)
+        {
+            _dbContext.MemoryFacts.Remove(fact);
+            await _dbContext.SaveChangesAsync();
+        }
+    }
+
+    /// <summary>Stores the embedding of one message for later semantic recall.</summary>
+    public async Task SaveMessageEmbedding(Guid sessionId, Guid messageId, string role, string content, string vector)
+    {
+        bool exists = await _dbContext.MessageEmbeddings.AnyAsync(e => e.MessageId == messageId);
+        if (exists) return;
+
+        _dbContext.MessageEmbeddings.Add(new MessageEmbedding
+        {
+            SessionId = sessionId,
+            MessageId = messageId,
+            Role = role,
+            Content = content,
+            Vector = vector
+        });
+        await _dbContext.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Returns stored embeddings for a session. Similarity is computed on the worker, which
+    /// avoids depending on a SQL Server version with native vector support.
+    /// </summary>
+    public async Task<List<MessageEmbeddingDto>> GetMessageEmbeddings(Guid sessionId)
+    {
+        return await _dbContext.MessageEmbeddings
+            .Where(e => e.SessionId == sessionId)
+            .OrderBy(e => e.CreatedAt)
+            .Select(e => new MessageEmbeddingDto
+            {
+                MessageId = e.MessageId,
+                Role = e.Role,
+                Content = e.Content,
+                Vector = e.Vector
+            })
+            .ToListAsync();
+    }
+
     public async Task<List<ModelConfiguration>> GetModelConfigurations()
     {
         return await _dbContext.ModelConfigurations.ToListAsync();
