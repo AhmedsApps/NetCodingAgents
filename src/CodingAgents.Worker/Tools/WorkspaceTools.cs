@@ -25,6 +25,30 @@ public class WorkspaceTools
 
     private static readonly string[] ImageExtensions = { ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp" };
 
+    // Prefer PowerShell 7 ("pwsh") when installed because it supports && and ||; Windows
+    // PowerShell 5.1 does not, and agents routinely emit those bash-style operators.
+    private static readonly Lazy<(string exe, bool supportsChaining)> Shell = new(() =>
+    {
+        foreach (var candidate in new[] { "pwsh.exe", "pwsh" })
+        {
+            try
+            {
+                using var probe = Process.Start(new ProcessStartInfo
+                {
+                    FileName = candidate,
+                    Arguments = "-NoProfile -Command \"exit 0\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                });
+                if (probe != null) { probe.WaitForExit(5000); if (probe.ExitCode == 0) return (candidate, true); }
+            }
+            catch { /* not installed */ }
+        }
+        return ("powershell.exe", false);
+    });
+
     public event Action<string, string>? OnProgress;
 
     // Raised when the agent produces an image file (e.g. a screenshot): (fileName, fullPath).
@@ -175,7 +199,7 @@ public class WorkspaceTools
         }
     }
 
-    [Description("Executes a shell command (such as 'dotnet build' or 'dotnet test') in the workspace and returns the output. The command is killed if it exceeds the timeout, so do not run long-lived processes like dev servers or watchers.")]
+    [Description("Runs a command in the workspace using Windows PowerShell and returns its output. IMPORTANT: this is PowerShell, not bash. Do not use '&&' or '||' - Windows PowerShell 5.1 rejects them. Run one command per call, or separate them with ';'. Use PowerShell equivalents (for example 'dir' or 'Get-ChildItem', not 'ls -la'). The command is killed if it exceeds the timeout, so do not start long-lived processes like dev servers or watchers.")]
     public string ExecuteCommand(
         [Description("The exact command string to run in the terminal.")] string command,
         [Description("Maximum seconds to allow the command to run before it is killed. Defaults to 120.")] int timeoutSeconds = 120)
@@ -185,10 +209,20 @@ public class WorkspaceTools
         {
             if (timeoutSeconds <= 0) timeoutSeconds = 120;
 
+            // Windows PowerShell 5.1 cannot parse && or ||; say so plainly instead of
+            // returning a cryptic parser error.
+            if (!Shell.Value.supportsChaining && Regex.IsMatch(command, @"(\|\||&&)"))
+            {
+                string err = "Error: this shell is Windows PowerShell 5.1, which does not support '&&' or '||'. " +
+                             "Run the commands separately, or join them with ';'. Example: 'dotnet build; dotnet test'.";
+                OnProgress?.Invoke("Error", err);
+                return err;
+            }
+
             var processInfo = new ProcessStartInfo
             {
-                FileName = "powershell.exe",
-                Arguments = $"-Command \"{command.Replace("\"", "\\\"")}\"",
+                FileName = Shell.Value.exe,
+                Arguments = $"-NoProfile -Command \"{command.Replace("\"", "\\\"")}\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,

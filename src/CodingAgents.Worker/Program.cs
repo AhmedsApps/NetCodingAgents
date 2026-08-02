@@ -13,6 +13,7 @@ using OllamaSharp;
 using Microsoft.Agents.AI;
 using CodingAgents.Shared;
 using CodingAgents.Worker.Tools;
+using CodingAgents.Worker.Agents;
 using System.Diagnostics;
 using OpenAI;
 using System.ClientModel;
@@ -312,34 +313,14 @@ public class Worker : BackgroundService
                 }
             };
 
-            string instructions = @"You are a local developer agent. You have direct access to the user's project workspace using tools.
-You are communicating with the user remotely via this chat interface. You can receive instructions from the user, inspect their codebase, edit files, and run build or test commands.
+            string instructions = ChatAgent.Instructions;
 
-Available tools:
-- ListFiles: Lists all files in the project workspace (excluding bin, obj, git directories). Call this to understand the project structure.
-- SearchInFiles: Searches file contents for a regular expression and returns matching files and line numbers. Use this to locate code instead of reading every file.
-- ReadFile: Reads the contents of a specific file. Use it to check code implementation.
-- WriteFile: Creates or overwrites an entire file. Use this for new files.
-- EditFile: Replaces an exact block of text in an existing file. Prefer this over WriteFile for small changes so you don't rewrite the whole file.
-- ExecuteCommand: Runs commands like 'dotnet build' or 'dotnet test' in the workspace. Always run this to verify your changes compile and pass tests. Do not run long-lived processes (dev servers, watchers); they will time out.
-- TakeScreenshot: Captures a screenshot of the computer screen and saves it as a PNG file in the workspace. It is automatically shown to the user in the chat.
-- AttachImage: Shows an existing image file from the workspace to the user in the chat. Use this whenever the user asks to see a picture, chart, or any image you created or found.
-
-This workspace is a dedicated folder for this conversation only; it starts empty unless you create files in it. Files the user attaches in the chat are saved here under their original name, so use ListFiles then ReadFile to open them. Relative paths resolve inside this folder, but you can read, write, or attach files anywhere on the machine by passing an absolute path (e.g. the user's Downloads folder). If you don't know the exact path, use ExecuteCommand (e.g. 'dir $env:USERPROFILE\Downloads') to find it.
-
-Guidelines:
-1. When the user asks you to perform a task, use the tools to examine the relevant files, make the edits, compile the code to check for errors, and verify the changes.
-2. When you produce or are asked for an image (a screenshot, a generated chart, etc.), attach it with TakeScreenshot or AttachImage so the user can actually see it.
-3. Report the final status, code changes, and test results back to the user clearly.
-4. Be concise and write standard, clean C# code.";
-
-            // The interactive chat agent additionally gets the screenshot + image-attach tools
-            // (exposed as quick-command buttons in the UI); the headless workflow agents do not.
+            // The interactive chat agent gets the full tool set, plus screenshot/image
+            // attaching and the durable memory tools the pipeline agents do not have.
             var chatTools = FullDevTools(tools);
             chatTools.Add(AIFunctionFactory.Create(tools.TakeScreenshot));
             chatTools.Add(AIFunctionFactory.Create(tools.AttachImage));
 
-            // Durable memory the agent controls itself, shared across sessions.
             chatTools.Add(AIFunctionFactory.Create(
                 async (string topic, string content) =>
                 {
@@ -361,12 +342,13 @@ Guidelines:
                         var facts = await _connection.InvokeAsync<List<MemoryFactDto>>("GetMemoryFacts", workspaceDir);
                         return facts.Count == 0
                             ? "No facts stored yet."
-                            : string.Join("\n", facts.Select(f => $"- {f.Topic}: {f.Content}"));
+                            : string.Join(Environment.NewLine, facts.Select(f => $"- {f.Topic}: {f.Content}"));
                     }
                     catch (Exception ex) { return "Could not read memory: " + ex.Message; }
                 },
                 "RecallFacts",
                 "List durable facts previously stored about this project."));
+
             // Seed the agent with what it already knows about this project.
             try
             {
@@ -379,7 +361,7 @@ Guidelines:
             }
             catch (Exception ex) { _logger.LogDebug("Could not load memory facts: {Message}", ex.Message); }
 
-            var agent = CreateAgent(chatClient, instructions, "WorkspaceAgent", chatTools);
+            var agent = CreateAgent(chatClient, instructions, ChatAgent.Name, chatTools);
 
             await _connection.SendAsync("ReportWorkerProgress", sessionId, "Status", "Agent executing local query...");
 
@@ -781,9 +763,7 @@ Guidelines:
         try
         {
             var transcript = string.Join("\n", dropped.Select(m => $"{m.Role}: {Shorten(m.Content, 1000)}"));
-            var instructions = "You maintain a running summary of a developer conversation. " +
-                "Merge the previous summary with the new messages into a single concise summary. " +
-                "Keep decisions, file names, and unresolved issues. Output only the summary.";
+            var instructions = SummarizerAgent.Instructions;
             var agent = CreateAgent(client, instructions, "Summarizer", null);
             var prompt = $"Previous summary:\n{(string.IsNullOrWhiteSpace(previousSummary) ? "(none)" : previousSummary)}\n\nNew messages:\n{transcript}";
             var summary = await RunAgentTextAsync(agent, prompt, ct, timeoutMinutes: 5);
@@ -798,6 +778,61 @@ Guidelines:
         {
             _logger.LogDebug("Summary update skipped: {Message}", ex.Message);
         }
+    }
+
+    /// <summary>
+    /// True when a command explicitly asks its agent to look at existing files or code.
+    /// The Analyst and Engineer are given inspection tools only in that case; by default
+    /// they work purely from the text they were handed.
+    /// </summary>
+    /// <summary>
+    /// Removes fenced code blocks from analysis output. The Analyst is told not to write
+    /// code, but models frequently do anyway; stripping it deterministically keeps
+    /// implementation decisions with the Engineer instead of leaking upstream.
+    /// </summary>
+    private static string StripCodeBlocks(string text, out int removed)
+    {
+        removed = 0;
+        if (string.IsNullOrEmpty(text) || !text.Contains("```")) return text;
+
+        // A local is required because an out parameter cannot be captured in a lambda.
+        int count = 0;
+        var cleaned = Regex.Replace(text, @"```[\s\S]*?```", _ =>
+        {
+            count++;
+            return "*(implementation detail removed - the Software Engineer decides how this is built)*";
+        });
+
+        // An unterminated final fence would otherwise leave a dangling block.
+        int stray = cleaned.IndexOf("```", StringComparison.Ordinal);
+        if (stray >= 0)
+        {
+            count++;
+            cleaned = cleaned.Substring(0, stray).TrimEnd();
+        }
+
+        removed = count;
+        return cleaned;
+    }
+
+    private static bool RequestsCodeInspection(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var t = text.ToLowerInvariant();
+
+        string[] phrases =
+        {
+            "existing code", "existing codebase", "the codebase", "current code",
+            "read the file", "read file", "check the file", "check the code",
+            "look at the file", "look at the code", "inspect the", "review the code",
+            "review the existing", "in the repository", "in the repo", "the solution",
+            "the project files", "already implemented", "refactor", "existing project"
+        };
+        if (phrases.Any(t.Contains)) return true;
+
+        // An explicit file name / path is also a request to go and look at it.
+        return Regex.IsMatch(text, @"\b[\w\-/\.]+\.(cs|razor|json|js|ts|html|css|xml|sql|md|py|java|cshtml)\b",
+                             RegexOptions.IgnoreCase);
     }
 
     private async Task<string> RunAgentTextAsync(ChatClientAgent agent, string prompt, CancellationToken ct, int? timeoutMinutes = null)
@@ -928,8 +963,23 @@ Guidelines:
             Directory.CreateDirectory(workspaceDir);
         }
 
+        // A brand-new project has nothing to inspect. Detect that up front so the team is
+        // told to design from scratch instead of being sent to analyse code that isn't there.
+        bool isNewProject;
+        try
+        {
+            isNewProject = !Directory.EnumerateFileSystemEntries(workspaceDir)
+                .Any(e => !Path.GetFileName(e).StartsWith("."));
+        }
+        catch { isNewProject = true; }
+
         // Report the resolved working directory so the UI can show where the team is working.
         await _connection.SendAsync("ReportWorkflowWorkspace", workflowId, workspaceDir);
+        if (isNewProject)
+        {
+            await _connection.SendAsync("ReportWorkflowLog", workflowId, "System",
+                "The working folder is empty, so this is treated as a new project: the team will design it from scratch rather than analyse existing code.");
+        }
         await _connection.SendAsync("ReportWorkflowLog", workflowId, "System", $"📁 Working directory: {workspaceDir}");
 
         // Builds a workspace tool set whose progress is streamed to the workflow log
@@ -964,15 +1014,28 @@ Guidelines:
             {
             await _connection.SendAsync("ReportWorkflowLog", workflowId, "Analyst", "System Analyst: Starting request analysis and design planning...");
 
-            var analystInstructions = @"You are a System Analyst and Software Designer. Your job is to take a user's development request, analyze the ACTUAL project structure using your tools, design a complete implementation plan, and write a detailed, step-by-step technical instruction prompt for a software engineer to execute.
-Use ListFiles, SearchInFiles, and ReadFile to inspect the real codebase before planning — do not guess at the structure.
-Be highly precise, list the directories/files that need modifications, and explain the architectural design decisions clearly.";
+            // The Analyst works from the user's written requirements only. It is handed
+            // inspection tools solely when the user explicitly asked for existing code to
+            // be examined, so it cannot go hunting for files by default.
+            bool analystMayInspect = RequestsCodeInspection(originalTask);
+
+            var analystInstructions = SystemAnalystAgent.Instructions(analystMayInspect);
 
             var analystTools = MakeTools("Analyst");
             var analystClient = await CreateChatClientAsync(settings.AnalystModel, modelConfigs);
-            var analystAgent = CreateAgent(analystClient, analystInstructions, "SystemAnalyst", ReadOnlyTools(analystTools));
+            // With nothing on disk, inspection tools only invite pointless calls.
+            var analystAgent = CreateAgent(analystClient, analystInstructions, "SystemAnalyst",
+                analystMayInspect ? ReadOnlyTools(analystTools) : null);
             analystPlan = await RunAgentTextAsync(analystAgent, originalTask, ct);
             if (string.IsNullOrEmpty(analystPlan)) analystPlan = "No design plan generated.";
+
+            // Enforce the "no code" rule rather than trusting the model to honour it.
+            analystPlan = StripCodeBlocks(analystPlan, out int strippedBlocks);
+            if (strippedBlocks > 0)
+            {
+                await _connection.SendAsync("ReportWorkflowLog", workflowId, "Analyst",
+                    $"Removed {strippedBlocks} code block(s) from the analysis - the analyst must produce requirements, not implementation.");
+            }
 
             await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, null, "Executing", null);
             await _connection.SendAsync("ReportWorkflowLog", workflowId, "Analyst", $"System Analyst Completed Plan:\n{analystPlan}");
@@ -991,13 +1054,15 @@ Be highly precise, list the directories/files that need modifications, and expla
             {
             await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer", "Software Engineer: Reviewing analyst plan and optimizing prompt for best practices...");
 
-            var engineerInstructions = @"You are a Senior Software Engineer. Your job is to review a System Analyst's implementation plan and instruction prompt.
-Use ListFiles, SearchInFiles, and ReadFile to verify the plan against the real code.
-Optimize the prompt to ensure industry-standard best practices in security, performance, naming conventions, and code safety.
-Output a clean, refined, and highly precise task description designed for an automated CLI agent (like Claude Code or Antigravity) to execute directly in the workspace.";
+            // The Engineer works from the Analyst's technical requirements only - not from
+            // the user's original prompt - and inspects code only if the Analyst asked for it.
+            bool engineerMayInspect = RequestsCodeInspection(analystPlan);
 
-            var engineerAgent = CreateAgent(engineerClientShared, engineerInstructions, "SoftwareEngineer", ReadOnlyTools(MakeTools("Engineer")));
-            engineerPlan = await RunAgentTextAsync(engineerAgent, $"Analyst Plan:\n{analystPlan}", ct);
+            var engineerInstructions = SoftwareEngineerAgent.Instructions(engineerMayInspect);
+
+            var engineerAgent = CreateAgent(engineerClientShared, engineerInstructions, "SoftwareEngineer",
+                engineerMayInspect ? ReadOnlyTools(MakeTools("Engineer")) : null);
+            engineerPlan = await RunAgentTextAsync(engineerAgent, $"Technical requirements from the System Analyst:\n{analystPlan}", ct);
             if (string.IsNullOrEmpty(engineerPlan)) engineerPlan = "No optimized prompt generated.";
 
             await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, engineerPlan, "Executing", null);
@@ -1081,7 +1146,9 @@ Output a clean, refined, and highly precise task description designed for an aut
                 await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, currentInstruction, $"Reviewing (Iteration {iteration})", settings.DefaultExecutor);
 
                 string changeContext = changedFiles.Count > 0
-                    ? $"The executor reported changes to these files:\n{string.Join("\n", changedFiles)}"
+                    ? (isNewProject
+                        ? $"This is a NEW project built from scratch. The executor created these files:\n{string.Join("\n", changedFiles)}"
+                        : $"The executor reported changes to these files:\n{string.Join("\n", changedFiles)}")
                     : "The executor may have changed files in the workspace (exact list unavailable).";
                 string reviewPrompt =
                     $"{changeContext}\n\n" +
@@ -1091,16 +1158,14 @@ Output a clean, refined, and highly precise task description designed for an aut
 
                 var reviewTools = MakeTools("Engineer");
 
-                string dotNetInstructions = @"You are a Senior .NET and SQL Programmer reviewing the code changes in the workspace.
-Use your tools to inspect the actual code. Then submit your decision via the SubmitVerdict tool (approved=true only if the code is clean, correct, and follows best practices).
-If you cannot call the tool, output exactly [APPROVED] if acceptable, otherwise [ISSUES_FOUND] followed by a detailed list of required fixes.";
+                string dotNetInstructions = ReviewerAgents.DotNetInstructions;
+
                 var dnClient = await CreateChatClientAsync(settings.DotNetReviewerModel, modelConfigs);
                 var (dnApproved, dnText) = await RunReviewerAsync(dnClient, dotNetInstructions, "DotNetReviewer", reviewTools, reviewPrompt, ct);
                 await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer", $"DotNetReviewer ({(dnApproved ? "APPROVED" : "ISSUES")}):\n{dnText}");
 
-                string archInstructions = @"You are a Senior Solution Architect reviewing the codebase for structural, architectural, and scalability issues.
-Use your tools to inspect the actual code. Then submit your decision via the SubmitVerdict tool (approved=true only if the design is sound and robust).
-If you cannot call the tool, output exactly [APPROVED] if acceptable, otherwise [ISSUES_FOUND] followed by a detailed list of required fixes.";
+                string archInstructions = ReviewerAgents.ArchitectInstructions;
+
                 var archClient = await CreateChatClientAsync(settings.ArchitectReviewerModel, modelConfigs);
                 var (archApproved, archText) = await RunReviewerAsync(archClient, archInstructions, "ArchitectureReviewer", reviewTools, reviewPrompt, ct);
                 await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer", $"ArchitectureReviewer ({(archApproved ? "APPROVED" : "ISSUES")}):\n{archText}");
@@ -1116,10 +1181,7 @@ If you cannot call the tool, output exactly [APPROVED] if acceptable, otherwise 
                 await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, currentInstruction, $"Validating (Iteration {iteration})", settings.DefaultExecutor);
                 await _connection.SendAsync("ReportWorkflowLog", workflowId, "Engineer", "Software Engineer is validating the reported issues...");
 
-                string validationInstructions = @"You are the Lead Software Engineer. Reviewers have rejected the current code and reported issues.
-Use ListFiles, ReadFile, and SearchInFiles to confirm whether the reported issues are real before deciding.
-If their concerns are valid, output [VALID] followed by a concrete, step-by-step instruction script for the Executor to apply the fixes.
-If their concerns are false, invalid, or impossible, output [REFUSED] followed by a detailed explanation of why you refuse to fix it.";
+                string validationInstructions = SoftwareEngineerAgent.ValidationInstructions;
 
                 var validationAgent = CreateAgent(engineerClientShared, validationInstructions, "SoftwareEngineer", ReadOnlyTools(MakeTools("Engineer")));
                 string validationText = await RunAgentTextAsync(validationAgent, $"Issues reported by reviewers:\n.NET Reviewer:\n{dnText}\n\nArchitect:\n{archText}", ct);
@@ -1149,7 +1211,7 @@ If their concerns are false, invalid, or impossible, output [REFUSED] followed b
                     else
                     {
                         await _connection.SendAsync("ReportWorkflowLog", workflowId, "System", "Reviewers rejected the refusal. Forcing the Engineer to generate fix instructions...");
-                        var forcedAgent = CreateAgent(engineerClientShared, "Output only a step-by-step instruction script to fix the original issues.", "SoftwareEngineer", null);
+                        var forcedAgent = CreateAgent(engineerClientShared, SoftwareEngineerAgent.ForcedFixInstructions, SoftwareEngineerAgent.Name, null);
                         string forcedText = await RunAgentTextAsync(forcedAgent, $"Issues:\n{dnText}\n{archText}", ct);
                         currentInstruction = string.IsNullOrEmpty(forcedText) ? "Fix the issues." : forcedText;
                     }
@@ -1247,9 +1309,7 @@ If their concerns are false, invalid, or impossible, output [REFUSED] followed b
             catch { /* logging best effort */ }
         };
 
-        var instructions = @"You are a local developer agent. You have direct access to the user's project workspace using tools.
-You are running an optimized plan generated by your software engineering team.
-Use SearchInFiles and ReadFile to understand the code, EditFile for small changes and WriteFile for new files, and ExecuteCommand ('dotnet build'/'dotnet test') to verify your work compiles and passes before finishing.";
+        var instructions = ExecutorAgent.Instructions;
 
         var agent = CreateAgent(chatClient, instructions, "WorkspaceAgent", FullDevTools(tools));
 
