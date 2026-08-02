@@ -1390,6 +1390,76 @@ public class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Recovers files from a model that described its work in markdown instead of calling
+    /// WriteFile. Weak models very often answer with "### index.html" followed by a fenced
+    /// block; without this the run produces nothing at all.
+    /// </summary>
+    /// <returns>The files it managed to write.</returns>
+    private static List<string> MaterializeFilesFromText(string text, string workspaceDir)
+    {
+        var written = new List<string>();
+        if (string.IsNullOrWhiteSpace(text)) return written;
+
+        // ```lang optional-name\n ...body... ```
+        var blocks = Regex.Matches(text, @"```([^\n]*)\n(.*?)```", RegexOptions.Singleline);
+        var lines = text.Split('\n');
+
+        foreach (Match block in blocks)
+        {
+            var info = block.Groups[1].Value.Trim();
+            var body = block.Groups[2].Value;
+            if (string.IsNullOrWhiteSpace(body)) continue;
+
+            // 1) filename on the fence itself: ```html index.html  /  ```html:index.html
+            string? name = FindFileName(info);
+
+            // 2) otherwise look at the few lines just above the fence
+            if (name == null)
+            {
+                int fenceLine = text.Substring(0, block.Index).Count(c => c == '\n');
+                for (int k = fenceLine - 1; k >= 0 && k >= fenceLine - 4; k--)
+                {
+                    name = FindFileName(lines[k]);
+                    if (name != null) break;
+                }
+            }
+
+            if (name == null) continue;
+
+            try
+            {
+                var full = Path.GetFullPath(Path.Combine(workspaceDir, name));
+                var dir = Path.GetDirectoryName(full);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(full, body.TrimEnd());
+                written.Add(name);
+            }
+            catch { /* skip anything that isn't a usable path */ }
+        }
+
+        return written;
+    }
+
+    /// <summary>Pulls a plausible file name out of a heading, label or fence info string.</summary>
+    private static string? FindFileName(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return null;
+
+        var m = Regex.Match(line,
+            @"(?<![\w./\-])([\w.\-]+(?:[/\][\w.\-]+)*\.(?:html?|css|js|ts|jsx|tsx|json|xml|md|cs|py|java|sql|txt|yml|yaml|svg))(?![\w])",
+            RegexOptions.IgnoreCase);
+        if (!m.Success) return null;
+
+        var candidate = m.Groups[1].Value.Replace((char)92, '/').Trim();   // backslash -> forward slash
+
+        // Reject absolute paths and directory traversal.
+        if (candidate.StartsWith("/") || candidate.Contains("..") || Regex.IsMatch(candidate, @"^[A-Za-z]:"))
+            return null;
+
+        return candidate;
+    }
+
     /// <summary>Resolves an executor setting (a ModelConfiguration name) to an Ollama model id.</summary>
     private static string ResolveOllamaModelName(string executorModel, List<ModelConfiguration> configs)
     {
@@ -1541,7 +1611,22 @@ public class Worker : BackgroundService
         string outputText = await RunAgentTextAsync(agent, prompt, ct);
         await _connection!.SendAsync("ReportWorkflowLog", workflowId, "Executor", string.IsNullOrEmpty(outputText) ? "No text output generated." : outputText);
 
-        return tools.ChangedFiles;
+        var changed = tools.ChangedFiles.ToList();
+
+        // Some models describe the files in markdown instead of calling WriteFile. Rather
+        // than produce nothing, salvage those blocks and write them to disk.
+        if (changed.Count == 0)
+        {
+            var salvaged = MaterializeFilesFromText(outputText, workspaceDir);
+            if (salvaged.Count > 0)
+            {
+                changed.AddRange(salvaged);
+                await _connection.SendAsync("ReportWorkflowLog", workflowId, "Executor",
+                    $"The model did not call WriteFile, but its answer contained {salvaged.Count} file(s), which have been written: {string.Join(", ", salvaged)}", ct);
+            }
+        }
+
+        return changed;
     }
 
     private bool IsClaudeBlocked()
@@ -1742,60 +1827,104 @@ public class OllamaToolParsingChatClient : DelegatingChatClient
         var toolNames = new HashSet<string>(
             (options?.Tools ?? Enumerable.Empty<AITool>()).OfType<AIFunction>().Select(f => f.Name),
             StringComparer.OrdinalIgnoreCase);
-        if (toolNames.Count == 0)
-        {
-            return response;
-        }
+        if (toolNames.Count == 0) return response;
 
-        if (response.Messages.Count > 0)
-        {
-            var message = response.Messages[0];
-            if ((message.Contents.Count == 0 || message.Text != null) &&
-                !message.Contents.Any(c => c is FunctionCallContent))
-            {
-                var text = message.Text?.Trim();
-                if (!string.IsNullOrEmpty(text) && text.StartsWith("{") && text.EndsWith("}"))
-                {
-                    try
-                    {
-                        var doc = JsonDocument.Parse(text);
-                        var root = doc.RootElement;
-                        if (root.TryGetProperty("name", out var nameProp)
-                            && nameProp.ValueKind == JsonValueKind.String
-                            && nameProp.GetString() is { Length: > 0 } name
-                            && toolNames.Contains(name))
-                        {
-                            var args = new Dictionary<string, object?>();
-                            if (root.TryGetProperty("arguments", out var argsProp) && argsProp.ValueKind == JsonValueKind.Object)
-                            {
-                                foreach (var prop in argsProp.EnumerateObject())
-                                {
-                                    object? val = prop.Value.ValueKind switch
-                                    {
-                                        JsonValueKind.String => prop.Value.GetString(),
-                                        JsonValueKind.Number => prop.Value.GetDouble(),
-                                        JsonValueKind.True => true,
-                                        JsonValueKind.False => false,
-                                        _ => prop.Value.GetRawText()
-                                    };
-                                    args[prop.Name] = val;
-                                }
-                            }
+        if (response.Messages.Count == 0) return response;
 
-                            var toolCall = new FunctionCallContent(Guid.NewGuid().ToString(), name, args);
-                            message.Contents.Clear();
-                            message.Contents.Add(toolCall);
-                        }
-                    }
-                    catch
-                    {
-                        // Fall back to normal text if parsing fails
-                    }
-                }
-            }
+        var message = response.Messages[0];
+        if (message.Contents.Any(c => c is FunctionCallContent)) return response;   // already fine
+
+        var text = message.Text;
+        if (string.IsNullOrWhiteSpace(text)) return response;
+
+        // Weak models emit tool calls as prose-embedded JSON, often inside a ```json fence
+        // and sometimes several at once. Scan the whole message rather than requiring the
+        // entire response to be a single JSON object.
+        var calls = ExtractToolCalls(text, toolNames);
+        if (calls.Count > 0)
+        {
+            message.Contents.Clear();
+            foreach (var c in calls) message.Contents.Add(c);
         }
 
         return response;
+    }
+
+    /// <summary>
+    /// Finds JSON tool calls anywhere in a model's text - inside code fences, after a
+    /// preamble, or several in sequence - and converts them to real function calls.
+    /// </summary>
+    private static List<FunctionCallContent> ExtractToolCalls(string text, HashSet<string> toolNames)
+    {
+        var found = new List<FunctionCallContent>();
+
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] != '{') continue;
+
+            // Walk to the matching brace, ignoring braces inside strings.
+            int depth = 0; bool inString = false, escaped = false; int end = -1;
+            for (int j = i; j < text.Length; j++)
+            {
+                char ch = text[j];
+                if (escaped) { escaped = false; continue; }
+                if (ch == (char)92) { escaped = true; continue; }   // backslash
+                if (ch == '"') { inString = !inString; continue; }
+                if (inString) continue;
+                if (ch == '{') depth++;
+                else if (ch == '}') { depth--; if (depth == 0) { end = j; break; } }
+            }
+            if (end < 0) break;
+
+            var candidate = text.Substring(i, end - i + 1);
+            try
+            {
+                var root = JsonDocument.Parse(candidate).RootElement;
+
+                // Accept {"name":...,"arguments":{...}} and the {"tool"/"function":...} variants.
+                string? name = null;
+                foreach (var key in new[] { "name", "tool", "function", "tool_name" })
+                {
+                    if (root.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.String)
+                    {
+                        var v = p.GetString();
+                        if (!string.IsNullOrEmpty(v) && toolNames.Contains(v)) { name = v; break; }
+                    }
+                }
+
+                if (name != null)
+                {
+                    JsonElement argsEl = default;
+                    foreach (var key in new[] { "arguments", "parameters", "args", "input" })
+                    {
+                        if (root.TryGetProperty(key, out argsEl) && argsEl.ValueKind == JsonValueKind.Object) break;
+                        argsEl = default;
+                    }
+
+                    var args = new Dictionary<string, object?>();
+                    if (argsEl.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var prop in argsEl.EnumerateObject())
+                        {
+                            args[prop.Name] = prop.Value.ValueKind switch
+                            {
+                                JsonValueKind.String => prop.Value.GetString(),
+                                JsonValueKind.Number => prop.Value.GetDouble(),
+                                JsonValueKind.True => true,
+                                JsonValueKind.False => false,
+                                _ => prop.Value.GetRawText()
+                            };
+                        }
+                    }
+
+                    found.Add(new FunctionCallContent(Guid.NewGuid().ToString(), name, args));
+                    i = end;   // continue scanning after this object
+                }
+            }
+            catch { /* not valid JSON - keep scanning */ }
+        }
+
+        return found;
     }
 }
 
