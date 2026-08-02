@@ -507,16 +507,22 @@ else
                             <div class="form-group">
                                 <label class="form-label">Default Code Executor</label>
                                 <span class="form-help">
-                                    Who carries out the work. The <strong>built-in agent</strong> runs entirely inside this
-                                    app using the model you choose &mdash; no external tools required. Claude Code CLI hands
-                                    the task to Anthropic's separate command-line tool, which must be installed locally.
+                                    Who carries out the work.
+                                    <strong>Built-in agent</strong> runs entirely inside this app using the model you choose &mdash; no external tools required.
+                                    <strong>Claude Code driven by Ollama</strong> uses the Claude Code CLI but points it at one of your local Ollama models
+                                    (via <code>ollama launch claude --config</code>), so no Anthropic API key or quota is used.
+                                    <strong>Claude Code CLI</strong> uses Anthropic's own service and is subject to its rate limits.
                                 </span>
                                 <select class="model-dropdown-select" @bind="UnifiedExecutorSelection">
                                     @foreach (var config in _modelConfigs)
                                     {
                                         <option value="Antigravity:@config.Name">Built-in agent + @config.Name (@config.Provider)</option>
                                     }
-                                    <option value="ClaudeCode">Claude Code CLI (external tool)</option>
+                                    @foreach (var config in _modelConfigs.Where(c => c.Provider == "Ollama"))
+                                    {
+                                        <option value="ClaudeOllama:@config.Name">Claude Code driven by Ollama + @config.Name (local, no API key)</option>
+                                    }
+                                    <option value="ClaudeCode">Claude Code CLI (Anthropic API)</option>
                                 </select>
                                 @if (_modelConfigs.Count == 0)
                                 {
@@ -834,6 +840,8 @@ else
             if (_dbSettings == null) return "";
             if (_dbSettings.DefaultExecutor == "ClaudeCode")
                 return "ClaudeCode";
+            if (_dbSettings.DefaultExecutor == "ClaudeOllama" && !string.IsNullOrEmpty(_dbSettings.ExecutorModel))
+                return $"ClaudeOllama:{_dbSettings.ExecutorModel}";
             if (_dbSettings.DefaultExecutor == "Antigravity" && !string.IsNullOrEmpty(_dbSettings.ExecutorModel))
                 return $"Antigravity:{_dbSettings.ExecutorModel}";
             return "Antigravity:"; // fallback
@@ -844,6 +852,11 @@ else
             if (value == "ClaudeCode")
             {
                 _dbSettings.DefaultExecutor = "ClaudeCode";
+            }
+            else if (value.StartsWith("ClaudeOllama:"))
+            {
+                _dbSettings.DefaultExecutor = "ClaudeOllama";
+                _dbSettings.ExecutorModel = value.Substring("ClaudeOllama:".Length);
             }
             else if (value.StartsWith("Antigravity:"))
             {

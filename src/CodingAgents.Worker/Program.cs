@@ -107,6 +107,10 @@ public class Worker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("CodingAgents Worker starting...");
+
+        // Check the environment before touching the network: if something local is missing
+        // the user should see it even when the server is unreachable.
+        await ReportEnvironmentAsync(stoppingToken);
         
         // 1. Initialize SignalR Connection
         var hubUrl = $"{_serverUrl.TrimEnd('/')}/chathub";
@@ -239,6 +243,128 @@ public class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Logs what this machine actually provides, so a misconfigured install is obvious at
+    /// startup instead of surfacing as a confusing failure mid-run.
+    /// </summary>
+    private async Task ReportEnvironmentAsync(CancellationToken ct)
+    {
+        var lines = new List<string>();
+
+        // Ollama reachable, and which models are installed?
+        try
+        {
+            using var http = new HttpClient { BaseAddress = new Uri(_ollamaUrl), Timeout = TimeSpan.FromSeconds(10) };
+            var client = new OllamaApiClient(http);
+            var models = (await client.ListLocalModelsAsync()).Select(m => m.Name).ToList();
+            lines.Add(models.Count > 0
+                ? $"OK    Ollama at {_ollamaUrl} - {models.Count} model(s): {string.Join(", ", models.Take(6))}"
+                : $"WARN  Ollama at {_ollamaUrl} is running but has NO models. Run 'ollama pull qwen2.5-coder' before using the built-in agent.");
+
+            if (!string.IsNullOrWhiteSpace(_embeddingModel))
+            {
+                lines.Add(models.Any(m => m.StartsWith(_embeddingModel, StringComparison.OrdinalIgnoreCase))
+                    ? $"OK    Embedding model '{_embeddingModel}' installed - semantic recall enabled."
+                    : $"WARN  Embedding model '{_embeddingModel}' not installed. Run 'ollama pull {_embeddingModel}' to enable semantic recall.");
+            }
+        }
+        catch (Exception ex)
+        {
+            lines.Add($"WARN  Ollama not reachable at {_ollamaUrl} ({ex.Message}). The built-in agent needs it unless you use an OpenAI/Anthropic endpoint.");
+        }
+
+        // Claude Code CLI (only needed if selected as the executor)
+        var claude = FindClaudeCli();
+        lines.Add(claude != null
+            ? $"OK    Claude Code CLI found: {claude}"
+            : "INFO  Claude Code CLI not found. That's fine unless you select it as the executor.");
+
+        // dotnet SDK, needed for the executor's build verification
+        lines.Add(ProbeCommand("dotnet", "--version", out var dotnetVer)
+            ? $"OK    .NET SDK {dotnetVer.Trim()}"
+            : "WARN  'dotnet' not found on PATH. The executor cannot run build or test commands.");
+
+        // Which shell the tools will use
+        lines.Add(ProbeCommand("powershell.exe", "-NoProfile -Command \"$PSVersionTable.PSVersion.ToString()\"", out var psVer)
+            ? $"OK    Windows PowerShell {psVer.Trim()}"
+            : "WARN  PowerShell not available - ExecuteCommand will fail.");
+
+        _logger.LogInformation("Environment check:\n  {Lines}", string.Join("\n  ", lines));
+
+        // Surface the warnings to the UI too, so they are not buried in a console window.
+        foreach (var w in lines.Where(l => l.StartsWith("WARN")))
+        {
+            _logger.LogWarning("{Warning}", w);
+        }
+        await Task.CompletedTask;
+    }
+
+    private static bool ProbeCommand(string exe, string args, out string output)
+    {
+        output = string.Empty;
+        try
+        {
+            using var proc = Process.Start(new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+            if (proc == null) return false;
+            output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(10000);
+            return proc.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// A fresh install has no model endpoints, which leaves the executor dropdown with no
+    /// built-in option at all. If none exist and Ollama has a model, register one so the
+    /// app is usable immediately.
+    /// </summary>
+    private async Task EnsureModelConfigurationAsync(CancellationToken ct)
+    {
+        if (_connection == null) return;
+        try
+        {
+            var existing = await _connection.InvokeAsync<List<ModelConfiguration>>("GetModelConfigurations", ct);
+            if (existing.Count > 0) return;
+
+            using var http = new HttpClient { BaseAddress = new Uri(_ollamaUrl), Timeout = TimeSpan.FromSeconds(10) };
+            var client = new OllamaApiClient(http);
+            var models = (await client.ListLocalModelsAsync()).Select(m => m.Name).ToList();
+            if (models.Count == 0)
+            {
+                _logger.LogWarning("No model endpoints configured and Ollama has no models installed. Add one under Settings > Model Configurations.");
+                return;
+            }
+
+            // Prefer something coding-oriented when available.
+            var preferred = models.FirstOrDefault(m => m.Contains("coder", StringComparison.OrdinalIgnoreCase))
+                         ?? models.FirstOrDefault(m => m.Contains("qwen", StringComparison.OrdinalIgnoreCase))
+                         ?? models.First();
+
+            var config = new ModelConfiguration
+            {
+                Name = "Local Ollama",
+                Provider = "Ollama",
+                ModelName = preferred,
+                BaseUrl = _ollamaUrl,
+                ApiKey = string.Empty
+            };
+            await _connection.InvokeAsync<ModelConfiguration>("SaveModelConfiguration", config, ct);
+            _logger.LogInformation("No model endpoints existed; registered 'Local Ollama' using '{Model}' so the built-in agent is selectable.", preferred);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Could not auto-create a model configuration: {Message}", ex.Message);
+        }
+    }
+
     private async Task StartInfiniteReconnectionLoop(CancellationToken stoppingToken)
     {
         if (_connection == null) return;
@@ -259,6 +385,8 @@ public class Worker : BackgroundService
                     continue;
                 }
                 _logger.LogInformation("Worker registered successfully with cloud hub.");
+
+                await EnsureModelConfigurationAsync(stoppingToken);
 
                 // Let the server know we are online to process queued tasks
                 await _connection.InvokeAsync("ProcessQueue", stoppingToken);
@@ -1120,6 +1248,7 @@ public class Worker : BackgroundService
                 await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, currentInstruction, $"Applying Fixes (Iteration {iteration})", settings.DefaultExecutor);
 
                 bool isBlocked = IsClaudeBlocked();
+                // Local models have no Anthropic rate limit, so only gate the API-backed mode.
                 if (isBlocked && settings.DefaultExecutor == "ClaudeCode")
                 {
                     await _connection.SendAsync("ReportWorkflowUpdate", workflowId, analystPlan, currentInstruction, "Queued", settings.DefaultExecutor);
@@ -1134,6 +1263,11 @@ public class Worker : BackgroundService
                 if (settings.DefaultExecutor == "ClaudeCode")
                 {
                     await RunClaudeCodeAsync(workflowId, currentInstruction, workspaceDir, ct);
+                }
+                else if (settings.DefaultExecutor == "ClaudeOllama")
+                {
+                    var ollamaModel = ResolveOllamaModelName(settings.ExecutorModel, modelConfigs);
+                    await RunClaudeCodeAsync(workflowId, currentInstruction, workspaceDir, ct, ollamaModel);
                 }
                 else
                 {
@@ -1256,26 +1390,111 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task RunClaudeCodeAsync(Guid workflowId, string prompt, string workspaceDir, CancellationToken ct)
+    /// <summary>Resolves an executor setting (a ModelConfiguration name) to an Ollama model id.</summary>
+    private static string ResolveOllamaModelName(string executorModel, List<ModelConfiguration> configs)
     {
-        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string claudeExePath = Path.Combine(localAppData, @"Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude-code\2.1.181\claude.exe");
+        var config = configs.FirstOrDefault(c => c.Name.Equals(executorModel, StringComparison.OrdinalIgnoreCase));
+        var name = config?.ModelName;
+        if (!string.IsNullOrWhiteSpace(name)) return name;
 
-        if (!File.Exists(claudeExePath))
+        return executorModel.StartsWith("Ollama:", StringComparison.OrdinalIgnoreCase)
+            ? executorModel.Substring("Ollama:".Length)
+            : executorModel;
+    }
+
+    /// <summary>
+    /// Locates the Claude Code CLI without pinning a version. Checks the versioned install
+    /// folder (newest first), then PATH. Returns null when it isn't installed.
+    /// </summary>
+    private static string? FindClaudeCli()
+    {
+        try
         {
-            throw new FileNotFoundException($"Claude CLI executable not found at '{claudeExePath}'");
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var roots = new[]
+            {
+                Path.Combine(localAppData, @"Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude-code"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "claude-code")
+            };
+
+            foreach (var root in roots)
+            {
+                if (!Directory.Exists(root)) continue;
+                // Version folders sort newest-last by name; prefer the most recent install.
+                var candidate = Directory.GetDirectories(root)
+                    .OrderByDescending(d => d, StringComparer.OrdinalIgnoreCase)
+                    .Select(d => Path.Combine(d, "claude.exe"))
+                    .FirstOrDefault(File.Exists);
+                if (candidate != null) return candidate;
+            }
+
+            // Fall back to whatever is on PATH (covers npm installs and non-Store setups).
+            var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
+            foreach (var dir in pathVar.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            {
+                foreach (var name in new[] { "claude.exe", "claude.cmd", "claude" })
+                {
+                    try
+                    {
+                        var full = Path.Combine(dir.Trim(), name);
+                        if (File.Exists(full)) return full;
+                    }
+                    catch { /* malformed PATH entry */ }
+                }
+            }
         }
+        catch { /* discovery is best-effort */ }
+        return null;
+    }
 
-        var processInfo = new ProcessStartInfo
+    /// <param name="ollamaModel">
+    /// When set, Claude Code is driven by this local Ollama model through
+    /// "ollama launch claude" instead of Anthropic's API - no API key or quota is used.
+    /// The model must support tool calling, or Ollama rejects the request.
+    /// </param>
+    private async Task RunClaudeCodeAsync(Guid workflowId, string prompt, string workspaceDir,
+                                          CancellationToken ct, string? ollamaModel = null)
+    {
+        ProcessStartInfo processInfo;
+
+        if (!string.IsNullOrWhiteSpace(ollamaModel))
         {
-            FileName = claudeExePath,
-            Arguments = $"-y \"{prompt.Replace("\"", "\\\"")}\"",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = workspaceDir
-        };
+            await _connection!.SendAsync("ReportWorkflowLog", workflowId, "Executor",
+                $"Running Claude Code against the local Ollama model '{ollamaModel}' (no Anthropic API used).", ct);
+
+            processInfo = new ProcessStartInfo
+            {
+                FileName = "ollama",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = workspaceDir
+            };
+            // ArgumentList avoids quoting problems with multi-line prompts.
+            foreach (var a in new[] { "launch", "claude", "--yes", "--model", ollamaModel, "--", "-p", prompt })
+            {
+                processInfo.ArgumentList.Add(a);
+            }
+        }
+        else
+        {
+            string claudeExePath = FindClaudeCli()
+                ?? throw new FileNotFoundException(
+                    "Claude CLI was not found. Install Claude Code, or put 'claude' on your PATH, " +
+                    "or choose the built-in agent as the executor instead.");
+
+            processInfo = new ProcessStartInfo
+            {
+                FileName = claudeExePath,
+                Arguments = $"-y \"{prompt.Replace("\"", "\\\"")}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = workspaceDir
+            };
+        }
 
         using var process = Process.Start(processInfo);
         if (process == null) throw new Exception("Failed to start Claude CLI process.");
@@ -1295,6 +1514,12 @@ public class Worker : BackgroundService
 
         if (process.ExitCode != 0 && !string.IsNullOrEmpty(error))
         {
+            if (error.Contains("does not support tools", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"The Ollama model '{ollamaModel}' does not support tool calling, which Claude Code requires. " +
+                    "Pick a tool-capable model (for example a qwen2.5-coder or llama3.1 build) as the executor model.");
+            }
             throw new Exception($"Claude CLI process exited with code {process.ExitCode}. Error: {error}");
         }
     }
